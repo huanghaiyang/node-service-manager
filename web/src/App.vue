@@ -3,8 +3,11 @@ import { computed, onMounted, onUnmounted, ref } from 'vue';
 import ServiceCard from './components/ServiceCard.vue';
 import ServiceDetail from './components/ServiceDetail.vue';
 import AddServiceModal from './components/AddServiceModal.vue';
+import ProcessPanel from './components/ProcessPanel.vue';
+import PortConflictModal from './components/PortConflictModal.vue';
 import {
   state, runningCount, totals, connect, disconnect, refresh, actions, toast,
+  initProcessPanel, persistProcessPanel, loadNodeProcesses,
 } from './store.js';
 import { formatBytes, formatPercent } from './format.js';
 
@@ -16,6 +19,7 @@ const hostWarningOpen = ref(false);
 
 const detailService = computed(() => state.services.find((s) => s.id === detailId.value) || null);
 const detailLogs = computed(() => (detailId.value ? state.logs[detailId.value] || [] : []));
+const panelOpen = computed(() => state.processPanel.open);
 
 const filtered = computed(() => {
   const kw = keyword.value.trim().toLowerCase();
@@ -30,10 +34,18 @@ const filtered = computed(() => {
 const host = computed(() => state.host || {});
 
 onMounted(() => {
+  initProcessPanel();
   connect();
   refresh();
+  if (state.processPanel.open) loadNodeProcesses({ refresh: true });
 });
 onUnmounted(disconnect);
+
+function togglePanel() {
+  state.processPanel.open = !state.processPanel.open;
+  persistProcessPanel();
+  if (state.processPanel.open && !state.processPanel.data) loadNodeProcesses({ refresh: true });
+}
 
 async function guard(fn) {
   busy.value = true;
@@ -49,6 +61,10 @@ async function refreshAll() {
 
 function openDetail(svc) {
   detailId.value = svc.id;
+}
+
+function openServiceById(id) {
+  if (id && state.services.some((s) => s.id === id)) detailId.value = id;
 }
 
 async function afterCreated(svc) {
@@ -116,7 +132,8 @@ async function afterCreated(svc) {
       </div>
     </header>
 
-    <main class="content">
+    <div class="app-body">
+      <main class="content">
       <div v-if="state.bootError" class="banner err" style="margin-bottom: 14px">
         <span>✕</span>
         <span class="grow">无法连接治理服务端：{{ state.bootError }}（请确认后端已启动）</span>
@@ -127,7 +144,17 @@ async function afterCreated(svc) {
         <button class="btn" :disabled="busy || !state.services.length" @click="guard(actions.startAll)">全部启动</button>
         <button class="btn" :disabled="busy || !state.services.length" @click="guard(actions.stopAll)">全部停止</button>
         <button class="btn ghost" :disabled="busy" @click="refreshAll">刷新</button>
-        <input v-model="keyword" class="input" style="width: 230px" placeholder="搜索名称 / 路径 / 端口…" />
+        <button
+          class="btn"
+          :class="panelOpen ? 'primary' : ''"
+          title="检测本机所有 node 进程，并标出属于已托管服务的那些"
+          @click="togglePanel"
+        >
+          🖥 进程检测器
+          <span class="tag blue">{{ state.nodeSummary.total }}</span>
+          <span v-if="state.nodeSummary.managed" class="tag green">{{ state.nodeSummary.managed }} 已托管</span>
+        </button>
+        <input v-model="keyword" class="input" style="width: 210px" placeholder="搜索名称 / 路径 / 端口…" />
         <span class="spacer" />
         <span class="hint">
           {{ state.services.length }} 个服务 · {{ totals.procs }} 个进程 ·
@@ -158,7 +185,14 @@ async function afterCreated(svc) {
           @open="openDetail"
         />
       </div>
-    </main>
+      </main>
+
+      <ProcessPanel
+        v-if="panelOpen"
+        @close="togglePanel"
+        @open-service="openServiceById"
+      />
+    </div>
 
     <ServiceDetail
       v-if="detailService"
@@ -168,6 +202,12 @@ async function afterCreated(svc) {
     />
 
     <AddServiceModal v-if="showAdd" @close="showAdd = false" @created="afterCreated" />
+
+    <PortConflictModal
+      v-if="state.portConflict"
+      :context="state.portConflict"
+      @close="state.portConflict = null"
+    />
 
     <div class="toast-host">
       <div v-for="t in state.toasts" :key="t.id" class="toast" :class="t.kind">{{ t.message }}</div>

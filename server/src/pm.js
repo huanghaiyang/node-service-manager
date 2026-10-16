@@ -267,6 +267,8 @@ export class ProcessManager extends EventEmitter {
       lastError: s.lastError || null,
       restarts: s.restarts || 0,
       autoRestartScheduled: Boolean(s.autoRestartScheduled),
+      // 本次运行实际注入的端口（可能来自端口冲突时的临时选择）
+      effectivePort: s.effectivePort ?? null,
       alive,
       plan: s.plan || null,
       logPaths: this.logs.paths(id),
@@ -325,8 +327,8 @@ export class ProcessManager extends EventEmitter {
     if (this._reconcileTimer.unref) this._reconcileTimer.unref();
   }
 
-  /** 启动服务 */
-  async start(id) {
+  /** 启动服务（可通过 portOverride 临时指定端口，用于端口冲突后换端口启动） */
+  async start(id, { portOverride = null } = {}) {
     const svc = this.store.get(id);
     if (!svc) throw Object.assign(new Error('服务不存在'), { code: 'NOT_FOUND' });
     const st = this.stateOf(id);
@@ -355,7 +357,11 @@ export class ProcessManager extends EventEmitter {
       SM_SERVICE_ID: id,
       SM_SERVICE_NAME: svc.name,
     };
-    if (svc.port) env.PORT = String(svc.port);
+    // 端口注入优先级：本次覆盖 > 服务配置。
+    // 注意 dotenv 默认不覆盖已存在的环境变量，所以这里注入的 PORT 会盖过项目 .env 里的值，
+    // 这正是「项目 .env 写的端口和前端代理对不上」时最省事的修法。
+    const effectivePort = Number(portOverride) > 0 ? Number(portOverride) : (svc.port || null);
+    if (effectivePort) env.PORT = String(effectivePort);
 
     let child;
     try {
@@ -383,6 +389,7 @@ export class ProcessManager extends EventEmitter {
       status: STATUS.STARTING,
       gen,
       pid: child.pid,
+      effectivePort,
       startedAt: new Date().toISOString(),
       stoppedAt: null,
       exitCode: null,
@@ -464,7 +471,8 @@ export class ProcessManager extends EventEmitter {
     this.logs.append(id, `将在 ${(delay / 1000).toFixed(0)}s 后自动重启（第 ${hist.length} 次）`, 'system');
     const t = setTimeout(async () => {
       try {
-        await this.start(id);
+        // 自动重启沿用本次运行实际使用的端口，避免又撞回被占用的那个
+        await this.start(id, { portOverride: this.runtime.get(id)?.effectivePort ?? null });
         const cur = this.runtime.get(id) || {};
         this._set(id, { restarts: (cur.restarts || 0) + 1, autoRestartScheduled: false });
       } catch (err) {
@@ -506,13 +514,13 @@ export class ProcessManager extends EventEmitter {
     return { stopped: true };
   }
 
-  async restart(id) {
+  async restart(id, opts = {}) {
     await this.stop(id).catch((err) => {
       if (err.code !== 'NOT_FOUND') throw err;
     });
     // 留一点时间让上一代进程的监听套接字彻底释放，避免新进程撞上 EADDRINUSE
     await sleep(500);
-    return this.start(id);
+    return this.start(id, opts);
   }
 
   /** 终止「外部运行中」的残留进程 */

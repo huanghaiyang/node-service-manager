@@ -5,6 +5,7 @@
  * 所有路径都从脚本位置推导，不写死本机绝对路径（既便于移植，也避免把开发机目录结构带进仓库）。
  */
 import path from 'node:path';
+import net from 'node:net';
 import { fileURLToPath } from 'node:url';
 
 const EXAMPLES_DIR = fileURLToPath(new URL('../examples', import.meta.url));
@@ -40,6 +41,16 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function alive(pid) {
   try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+/** 该端口上是否已有服务在响应（用于验证端口确实被新进程占用/释放） */
+async function portTaken(port) {
+  try {
+    await fetch(`http://127.0.0.1:${port}/`, { signal: AbortSignal.timeout(1200) });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 console.log(`\n=== Node 服务治理工具 · 端到端冒烟测试 ===\n服务端: ${BASE}\n目标包: ${PKG}\n`);
@@ -170,6 +181,53 @@ for (let i = 0; i < 5; i += 1) {
 check('强制停止后状态稳定为 stopped（exit 竞态回归）',
   raceStatuses.every((s) => s === 'stopped'),
   `5 轮结果：${raceStatuses.join(' / ')}`);
+
+/* 9c. 端口占用预检 → 随机分配可用端口 → 用新端口启动
+      测试自己在本进程内占住端口，因此不依赖任何外部进程，可重复运行。 */
+const CONFLICT_PORT = 7105;
+const squatter = net.createServer(() => {});
+await new Promise((resolve, reject) => {
+  squatter.once('error', reject);
+  squatter.listen(CONFLICT_PORT, '127.0.0.1', resolve);
+});
+await api(`/api/services/${id}`, { method: 'PATCH', body: { port: CONFLICT_PORT } });
+
+const pf = (await api(`/api/services/${id}/preflight`)).json;
+check('预检发现目标端口被占用', pf.checked === true && pf.occupied === true, `via=${pf.via} port=${pf.port}`);
+check('预检定位到占用者 PID', pf.occupants?.[0]?.pid === process.pid,
+  `occupant=${JSON.stringify(pf.occupants?.[0] || null)}`);
+check('预检给出随机可用端口', Number.isInteger(pf.suggestion) && pf.suggestion > 0, `suggestion=${pf.suggestion}`);
+check('预检给出的端口确实是空闲的', pf.suggestion ? !(await portTaken(pf.suggestion)) : false, `port=${pf.suggestion}`);
+
+const startedOnNew = await api(`/api/services/${id}/start`, { method: 'POST', body: { port: pf.suggestion } });
+check('用推荐端口启动成功', startedOnNew.ok && startedOnNew.json.appliedPort === pf.suggestion,
+  `appliedPort=${startedOnNew.json?.appliedPort}`);
+
+// 端口表是 5s 一档的快照，给它足够时间收敛；期间持续确认服务确实在运行
+let svcNew = null;
+let listening = false;
+for (let i = 0; i < 6 && !listening; i += 1) {
+  await sleep(2000);
+  svcNew = (await api(`/api/services/${id}`)).json.service;
+  listening = (svcNew.ports || []).some((p) => p.port === pf.suggestion);
+}
+check('实际监听的是新端口', listening,
+  `status=${svcNew?.status ?? svcNew?.state?.status} pid=${svcNew?.state?.pid} ports=${JSON.stringify(svcNew?.ports || [])}`);
+
+/* 9d. Node 进程检测器 */
+const det = (await api('/api/processes/node?refresh=1')).json;
+const mine = (det.processes || []).filter((p) => p.serviceId === id);
+check('进程检测器标记出已托管的 node 进程', mine.length > 0,
+  mine.map((p) => `${p.pid}(${p.role},${p.matchedBy})`).join(', ') || `total=${det.total}`);
+check('标记出的进程带上了自己的监听端口',
+  mine.some((p) => (p.ports || []).some((x) => x.port === pf.suggestion)),
+  JSON.stringify(mine.map((p) => p.ports)));
+check('检测器返回枚举来源与占用信息', Boolean(det.enumerateSource) && Array.isArray(det.processes),
+  `source=${det.enumerateSource}, total=${det.total}, managed=${det.managedCount}`);
+
+await api(`/api/services/${id}/stop`, { method: 'POST', body: { force: true } });
+await new Promise((resolve) => squatter.close(resolve));
+await sleep(600);
 
 /* 10. 目录定位能力 */
 const parent = await api('/api/fs/list?path=' + encodeURIComponent(EXAMPLES_DIR));

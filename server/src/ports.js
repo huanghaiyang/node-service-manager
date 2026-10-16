@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
+import net from 'node:net';
 import path from 'node:path';
 import { captureStdout } from './util.js';
 
@@ -133,6 +134,112 @@ export class PortScanner {
     // 具体地址优先，其次端口升序
     out.sort((a, b) => addressRank(a.address) - addressRank(b.address) || a.port - b.port);
     return out;
+  }
+
+  /**
+   * 反查：谁在监听这个端口。
+   * 数据来自最近一次全表探测（netstat / /proc / lsof 都能拿到归属 PID）。
+   * @returns {Array<{pid:number, port:number, proto:string, address:string}>}
+   */
+  whoListensOn(port) {
+    const target = Number(port);
+    if (!Number.isInteger(target) || target <= 0) return [];
+    const out = [];
+    for (const [pid, entries] of this.byPid) {
+      for (const e of entries) {
+        if (e.port === target && e.proto === 'tcp') out.push({ pid, ...e });
+      }
+    }
+    out.sort((a, b) => addressRank(a.address) - addressRank(b.address));
+    return out;
+  }
+
+  /** 该端口上是否已有监听者（TCP） */
+  isOccupied(port) {
+    return this.whoListensOn(port).length > 0;
+  }
+
+  /* ---------------------------- 可用端口 ---------------------------------- */
+
+  /** 用绑定测试判断端口是否可用（端口探测不可用时的兜底手段） */
+  static probeFree(port, host = '127.0.0.1') {
+    return new Promise((resolve) => {
+      const srv = net.createServer();
+      let settled = false;
+      const done = (free) => {
+        if (settled) return;
+        settled = true;
+        try { srv.close(); } catch { /* ignore */ }
+        resolve(free);
+      };
+      srv.once('error', () => done(false));
+      srv.once('listening', () => done(true));
+      try {
+        srv.listen(port, host);
+      } catch {
+        done(false);
+      }
+      setTimeout(() => done(false), 1200);
+    });
+  }
+
+  /**
+   * 找一个没人用的端口：优先在推荐区间里随机取，逐个做绑定测试。
+   * 随机起点可以让连续多次请求拿到不同结果，避免所有人挤在同一个「下一个可用端口」上。
+   * @returns {Promise<number|null>}
+   */
+  static async findFreePort({ min = 10000, max = 60000, host = '127.0.0.1', attempts = 30 } = {}) {
+    const span = Math.max(1, max - min);
+    for (let i = 0; i < attempts; i += 1) {
+      const candidate = min + Math.floor(Math.random() * span);
+      // 组合判断：既绑定测试，也避开别人已经监听但我们还没探测到的窗口
+      if (await PortScanner.probeFree(candidate, host)) return candidate;
+    }
+    // 极端情况下的兜底：让操作系统直接分配一个空闲端口
+    return new Promise((resolve) => {
+      const srv = net.createServer();
+      srv.once('error', () => resolve(null));
+      srv.listen(0, host, () => {
+        const port = srv.address()?.port ?? null;
+        try { srv.close(() => resolve(port)); } catch { resolve(port); }
+      });
+    });
+  }
+
+  /* ---------------------------- 端口归属 ---------------------------------- */
+
+  /**
+   * 综合判断某个端口是否被占用，并给出占用者信息。
+   * 端口表不可用时退化为纯绑定测试（此时拿不到占用者 PID）。
+   */
+  async inspectPort(port, { refreshIfStaleMs = 2500 } = {}) {
+    const target = Number(port);
+    if (!Number.isInteger(target) || target <= 0 || target > 65535) {
+      return { checked: false, reason: 'invalid-port', port: target || null };
+    }
+    if (Date.now() - this.sampledAt > refreshIfStaleMs) {
+      await this.refresh().catch(() => {});
+    }
+    let listeners = this.whoListensOn(target);
+    if (!listeners.length) {
+      // 端口表说没人，再用绑定测试确认（能发现刚起来、还没进快照的进程）
+      const free = await PortScanner.probeFree(target);
+      if (free) {
+        return { checked: true, port: target, occupied: false, via: 'bind-probe', occupants: [] };
+      }
+      // 绑定失败但快照里查不到占用者：多半是快照刚好过期，强制重扫一次再判定，
+      // 否则冲突弹窗只能显示「无法定位占用者」，排查价值大打折扣。
+      await this.refresh().catch(() => {});
+      listeners = this.whoListensOn(target);
+      return {
+        checked: true,
+        port: target,
+        occupied: true,
+        via: listeners.length ? 'port-scan-rescan' : 'bind-probe',
+        occupants: listeners,
+      };
+    }
+    return { checked: true, port: target, occupied: true, via: 'port-scan', occupants: listeners };
   }
 
   /* ------------------------------ Windows -------------------------------- */

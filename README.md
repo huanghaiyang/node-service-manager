@@ -19,6 +19,8 @@
 | CPU / 内存采集 | 默认 3s 采样，卡片上直接画 CPU 与内存曲线；详情页可看单进程明细（PID / 进程名 / 占用） |
 | 监听端口探测 | 实时探测服务**真正在监听**的端口（TCP/UDP、绑定地址），而不是只看配置里声明的数字；停止后自动清空 |
 | 浏览器入口 | 卡片与详情页都有「浏览器打开 ↗」，一键直达服务页面；入口地址可由探测到的端口自动推导，也可手工指定（支持 https / 内网域名 / 带路径） |
+| 端口占用预检 | 启动前检查目标端口；被占用时弹窗显示**谁占用了它**（PID/进程名/是否另一个托管服务），并随机分配一个可用端口，也可手动填写 |
+| Node 进程检测器 | 默认隐藏的侧边栏，一键展开后列出本机所有 node 进程（PID / 内存 / CPU / 各自监听的端口 / 命令行），并**标记出属于已托管服务的那些** |
 | 日志 | 子进程 stdout/stderr 落盘留存 + 内存环形缓冲，支持按流筛选、关键字搜索（高亮）、自动滚动、复制、清空；管理端重启后仍可回溯历史日志 |
 | 异常处理 | 异常退出自动重启（指数退避，最多 5 次/分钟，可选）；管理端重启后能识别「进程还在但已脱离托管」的残留服务并一键终止 |
 | 批量操作 | 全部启动 / 全部停止 |
@@ -36,6 +38,10 @@
 | 卡片上的监听端口与浏览器入口 | 详情页：端口明细 + 入口 |
 | --- | --- |
 | ![端口与入口](docs/screenshots/06-ports-entry.png) | ![入口详情](docs/screenshots/07-entry-detail.png) |
+
+| 端口占用预检（冲突时弹窗） | Node 进程检测器（默认隐藏，可展开） |
+| --- | --- |
+| ![端口冲突](docs/screenshots/08-port-conflict.png) | ![进程检测器](docs/screenshots/09-process-detector.png) |
 
 ---
 
@@ -158,8 +164,45 @@ npm run build && npm start
 
 探测周期默认 5s（比指标采样慢一档，端口变化不频繁），一次刷新覆盖所有服务。
 
-### 5. 查看日志
+### 5. 端口占用预检
 
+点「启动」时会**先检查目标端口**，只有确认被占用才会打断你：
+
+1. 端口空闲 → 直接启动，不增加任何多余点击；
+2. 端口被占用 → 弹出对话框，包含
+   - **占用者信息**：PID、进程名、绑定地址，若占用者是另一个托管服务会直接点明；
+   - **系统随机分配的可用端口**（默认选中，可反复「换一个」）；
+   - **手动指定端口**输入框；
+   - 「同时保存为该服务的端口」勾选项；
+   - 「仍然用原端口启动」的兜底入口。
+
+预检的端口来源按优先级取：请求里显式指定 → 服务配置的 `port` → 上次实际探测到的 TCP 端口。
+服务正在运行时跳过预检（那时端口当然「被占用」，是它自己）。
+
+判定手段是「端口表反查 + 绑定测试」双保险：先用系统端口快照反查归属 PID，
+查不到再真正尝试绑定一次；若绑定失败但快照里也没有，会**强制重扫一次端口表**，
+避免刚起来的进程定位不到占用者。
+
+> **顺带一个实用结论**：勾选保存后，端口会以 `PORT` 环境变量注入子进程。
+> 由于 dotenv 默认**不覆盖**已存在的环境变量，这里的值会优先于项目 `.env` 里的 `PORT`。
+> 当前后端代理目标写死在别处（例如 vite 的 `API_TARGET`）而两边不一致时，
+> 用治理工具统一端口是最省事的修法 —— 详见文末的排查案例。
+
+### 6. Node 进程检测器
+
+顶栏的「🖥 进程检测器」按钮会展开右侧栏（**默认隐藏**，开关状态记在浏览器本地）：
+
+- 列出本机**所有 node 进程**：PID、父进程、内存、CPU、各自监听的端口、命令行（能拿到时）、启动时间；
+- 属于已托管服务的进程会**高亮并打上服务名标签**，点一下直接跳到该服务的详情抽屉；
+- 「仅已托管」过滤、按 PID / 端口 / 命令 / 服务名搜索；
+- 「刷新」立刻重新枚举（默认 5s 自动刷新，可关）；
+- 面板头部显示当前**枚举来源**，例如「复用进程快照（完整枚举）」或
+  「Get-Process 降级枚举（无进程树/命令行）」，不会假装拿到了没有的数据。
+
+它解决的正是「我只看到前端起来了，后端呢？」这类问题：monorepo 下一个服务往往有
+concurrently → npm → tsx/vite 好几个进程，在这里能一次看全，并且每个进程都带端口。
+
+### 7. 查看日志
 详情抽屉的「日志」页：
 
 - 按 `全部 / stdout / stderr / 系统` 筛选，带条数统计
@@ -241,7 +284,7 @@ service-manager/
 │   ├── packageScanner.js       # package.json 定位/解析/目录浏览/批量扫描
 │   ├── pm.js                   # 进程管理器：启动计划解析、启停、状态机、进程树终止
 │   ├── metrics.js              # 跨平台进程指标采集与进程树聚合
-│   ├── ports.js                # 监听端口探测（netstat / /proc / lsof）+ 入口地址推导
+│   ├── ports.js                # 监听端口探测（netstat / /proc / lsof）、占用反查、随机可用端口
 │   ├── logs.js                 # 日志落盘 + 增量 tail + 环形缓冲
 │   └── util.js                 # 进程存活探测、参数转义等
 ├── web/
@@ -250,6 +293,7 @@ service-manager/
 │       ├── main.js  App.vue  store.js  api.js  format.js  styles.css
 │       └── components/  ServiceCard / ServiceDetail / LogPanel
 │                        AddServiceModal / Sparkline
+│                        ProcessPanel（进程检测器）/ PortConflictModal（端口冲突）
 ├── scripts/
 │   ├── build-web.mjs           # 纯 JS 前端构建（@vue/compiler-sfc）
 │   ├── dev.mjs                 # 同时起服务端与前端构建 watcher
@@ -301,11 +345,13 @@ npx vite build    # 打包压缩产物到 dist/
 | GET | `/api/services/:id` | 单个服务详情 |
 | PATCH | `/api/services/:id` | 修改配置（运行中会拒绝，需先停止） |
 | DELETE | `/api/services/:id?force=true` | 移除托管（force 会一并终止进程） |
-| POST | `/api/services/:id/start` | 启动 |
+| POST | `/api/services/:id/start` | 启动（body 可带 `{ port, persistPort }` 指定/改写端口） |
 | POST | `/api/services/:id/stop` | 停止（body: `{ force: true }` 强制） |
-| POST | `/api/services/:id/restart` | 重启 |
+| POST | `/api/services/:id/restart` | 重启（同样支持 `{ port }`） |
 | POST | `/api/services/:id/kill-orphan` | 终止残留进程 |
 | GET | `/api/services/:id/plan` | 预览实际会执行的命令与 mode |
+| GET | `/api/services/:id/preflight?port=` | **启动前端口预检**：是否被占用、占用者信息、随机可用端口 |
+| GET | `/api/processes/node?refresh=1` | **Node 进程检测器**：全机 node 进程 + 端口 + 归属标记 |
 | GET | `/api/services/:id/logs?limit=500` | 读取日志（含磁盘字节数与落盘路径） |
 | DELETE | `/api/services/:id/logs` | 清空日志 |
 | POST | `/api/services/start-all` | 批量启动 |
@@ -371,44 +417,53 @@ npm run test:smoke
 
 ```
 === Node 服务治理工具 · 端到端冒烟测试 ===
-  [PASS] 健康检查 /api/health  — pid=11744
+  [PASS] 健康检查 /api/health  — pid=38276
   [PASS] 解析 package.json  — recommendedScript=start entry=✓
-  [PASS] 纳管服务 POST /api/services  — id=9c936aa340838369
+  [PASS] 纳管服务 POST /api/services  — id=f859e82acca790dd
   [PASS] 预览启动计划  — mode=node-direct → node index.js
-  [PASS] 启动服务  — pid=6352
+  [PASS] 启动服务  — pid=31168
   [PASS] 状态变为 running  — status=running
-  [PASS] 进程存活  — pid=6352
-  [PASS] 采集到日志  — 7 行, 磁盘 {"out":118,"err":0}
+  [PASS] 进程存活  — pid=31168
+  [PASS] 采集到日志  — 7 行, 磁盘 {"out":119,"err":0}
   [PASS] 日志含服务启动输出  — [demo-service] listening on http://127.0.0.1:7100
   [PASS] 系统日志无重复（回归）  — 无重复
-  [PASS] 上报内存占用  — 89.2 MB
-  [PASS] 上报 CPU 占用  — 占整机 6.20% / 单核基准 99.2%
+  [PASS] 上报内存占用  — 89.1 MB
+  [PASS] 上报 CPU 占用  — 占整机 6.08% / 单核基准 97.3%
   [PASS] 指标采样作用域已知  — scope=process
-  [PASS] 指标历史累积（用于曲线）  — 3 个采样点
+  [PASS] 指标历史累积（用于曲线）  — 2 个采样点
   [PASS] 探测到监听端口  — [{"address":"0.0.0.0","port":7100,"proto":"tcp"}]
   [PASS] 入口地址按探测端口推导  — http://127.0.0.1:7100/（source=detected, live=true）
   [PASS] 入口地址可访问  — http://127.0.0.1:7100/
   [PASS] 端口探测方式已知  — netstat / netstat -ano
-  [PASS] 宿主指标 /api/system  — 16 核 / 内存 21.4GB 已用 / 采集器 basic
+  [PASS] 宿主指标 /api/system  — 16 核 / 内存 22.5GB 已用 / 采集器 basic
   [PASS] 停止服务  — status=stopped
-  [PASS] 进程已被终止  — pid=6352
+  [PASS] 进程已被终止  — pid=31168
   [PASS] 服务端口已释放  — 端口 7100 已关闭
   [PASS] 停止后端口探测结果清空  — []
   [PASS] 停止后入口退化为配置声明  — http://127.0.0.1:7100/（source=declared）
   [PASS] 入口地址可手工覆盖并自动补协议  — http://app.internal:8080/health（source=override）
-  [PASS] 重启服务  — 新 pid=42692（旧 6352）
-  [PASS] 重启后状态与 PID 不被上一代 exit 篡改（代次隔离回归）  — 2.5s 后 status=running pid=42692
+  [PASS] 重启服务  — 新 pid=21336（旧 31168）
+  [PASS] 重启后状态与 PID 不被上一代 exit 篡改（代次隔离回归）  — 2.5s 后 status=running pid=21336
   [PASS] 强制停止后状态稳定为 stopped（exit 竞态回归）  — 5 轮结果：stopped / stopped / stopped / stopped / stopped
+  [PASS] 预检发现目标端口被占用  — via=port-scan-rescan port=7105
+  [PASS] 预检定位到占用者 PID  — occupant={"pid":42320,"port":7105,"address":"127.0.0.1","name":"node",...}
+  [PASS] 预检给出随机可用端口  — suggestion=30136
+  [PASS] 预检给出的端口确实是空闲的  — port=30136
+  [PASS] 用推荐端口启动成功  — appliedPort=30136
+  [PASS] 实际监听的是新端口  — status=running pid=32576 ports=[{"address":"0.0.0.0","port":30136,"proto":"tcp"}]
+  [PASS] 进程检测器标记出已托管的 node 进程  — 32576(root,pid)
+  [PASS] 标记出的进程带上了自己的监听端口  — [[{"address":"0.0.0.0","port":30136,"proto":"tcp"}]]
+  [PASS] 检测器返回枚举来源与占用信息  — source=basic, total=6, managed=1
   [PASS] 目录浏览：列出子目录  — 1 个子目录，其中 0 个 package.json
   [PASS] 目录浏览：命中 package.json  — demo-service@1.0.0，推荐 script=start
   [PASS] 目录浏览：返回上级路径  — parent=<仓库路径>/examples
   [PASS] 批量扫描 package.json  — 命中 1 个
   [PASS] 移除托管记录  — 清理完成
 
-=== 结果: 33/33 通过 ===
+=== 结果: 42/42 通过 ===
 ```
 
-最后两条是开发过程中定位到真实缺陷后补的回归用例，值得单独说明：
+最后几条是开发过程中定位到真实缺陷后补的回归用例，值得单独说明：
 
 - **exit 竞态回归**：进程被操作系统回收与其 `exit` 事件送达之间存在时间差。
   最初只看「当前状态是否为 stopping」来判定，导致显式 `stop()` 之后迟到的 `exit`
@@ -417,15 +472,46 @@ npm run test:smoke
   可能在这之后才送达；若不隔离，它会**清空新一代进程的 PID**，
   使新进程彻底脱离托管（状态显示 crashed，但进程仍在跑并占着端口）。
   现在每次 spawn 递增一个 `gen`，只有当前代的 `exit`/`error` 才能改写状态。
+- **端口预检与检测器（最后 9 条）**：测试自己在本进程内占住一个端口来制造冲突，
+  因此不依赖任何外部程序、可重复运行；覆盖「占用判定 → 定位占用者 PID →
+  随机分配可用端口 → 用新端口启动 → 真正监听该端口 → 检测器标记归属」全链路。
 
-另外，端口探测与入口地址这 7 条用例是在真实浏览器中点击验证过 UI 之后补进自动化测试的：
-卡片与详情抽屉都渲染出 `<a href="http://127.0.0.1:7100/" target="_blank" rel="noopener noreferrer">`，
-并且该地址确实能被浏览器打开（示例服务返回 JSON）。
+端口探测、入口地址、预检弹窗与进程检测器这几组功能，都是先在真实浏览器里点击验证过 UI，
+再补进自动化测试的：卡片与详情抽屉确认渲染出
+`<a href="http://127.0.0.1:7100/" target="_blank" rel="noopener noreferrer">`，
+冲突弹窗确认显示了占用者 PID 与随机端口，检测器确认列出全部 node 进程及其端口。
 
 
 ---
 
 ## 常见问题
+
+### 排查案例：monorepo 里「只起来了前端，后端没起来」
+
+真实踩坑记录（hunyuan3d-workbench：`concurrently` 同时拉起 `apps/api` 与 `apps/web`），
+现象是前端页面能打开但所有接口 502/ECONNREFUSED，看起来像「后端没启动」。实际排查结论：
+
+| 证据 | 结论 |
+| --- | --- |
+| 治理工具日志里 `[api] … 工作台已启动: http://127.0.0.1:8786` | **后端确实起来了**，监听在 8786 |
+| 前端 vite 日志反复 `http proxy error … ECONNREFUSED 127.0.0.1:8787` | 前端在往 **8787** 打 |
+| `apps/api/src/config.ts`：`port: int(process.env.PORT, 8787)` | 后端默认 8787，但被环境变量覆盖了 |
+| `apps/web/vite.config.ts`：`API_TARGET ?? 'http://127.0.0.1:8787'` | 前端代理目标写死默认 8787 |
+| 项目根 `.env` 第 10 行：`PORT=8786`（而 `.env.example` 是 8787） | **真正的元凶**：本地把后端端口改成了 8786，前端代理没跟着改 |
+
+vite 只会把 `VITE_` 前缀的变量注入客户端，`vite.config.ts` 里的 `process.env.API_TARGET`
+也读不到 `.env`，所以两边就此错开。
+
+**推荐做法**：把治理工具的「监听端口」填成 8787（或任何一致的值）。
+端口会以 `PORT` 注入子进程，而 dotenv 默认不覆盖已存在的环境变量，
+因此它会盖过 `.env`，前后端立刻对齐。
+**另一种做法**：在 `vite.config.ts` 里用 `loadEnv(mode, root, '')` 读 `.env`，
+再把 `API_TARGET` 统一指向 `PORT`。
+
+这类问题现在可以更快定位：**进程检测器**会同时列出 `vite` 与 `tsx` 两个进程各自的监听端口，
+一眼就能看出「后端在 8786、前端在找 8787」。
+
+### 其他常见问题
 
 **Q：服务启动了但 CPU/内存一直是 0 或 —。**
 先等两个采样周期（默认 6 秒）。CPU 是区间差值，第一个点无法计算。
@@ -470,6 +556,10 @@ Windows 上 `taskkill /T` 对无窗口的控制台程序通常无效，会自动
 - CPU 是两次采样的差值，因此服务启动后需要等到下一次采样才会出现非零 CPU。
 - 端口探测默认 5s 一次，服务刚启动到端口出现在界面上最多有 5s 延迟；
   探测依赖系统工具（Windows `netstat`、macOS `lsof`），若被裁剪或禁用则只显示配置声明的端口。
+- 端口预检只针对**服务配置/上次探测到的那一个端口**。如果应用自己从 `.env` 或代码里挑了别的端口，
+  预检无从得知；此时以「进程检测器」看到的实际监听端口为准。
+- 进程检测器在 Windows 上依赖 WMI 才能拿到命令行与父子关系；
+  WMI 不可用时退化为 `Get-Process` 枚举，只有 PID、内存、CPU 与端口（界面会如实标注）。
 - 浏览器入口默认指向 `127.0.0.1`：服务若绑定 `0.0.0.0` 且你从其它机器访问本控制台，
   需要手工把入口地址改成实际可达的地址。
 - 端口探测只能看到「本工具托管的那棵进程树」的端口；服务若自行 fork 出脱离进程树的新进程，

@@ -192,6 +192,13 @@ export class ProcessSampler {
     this._lastFull = new Map();
     this._hostPrev = null;
     this.cores = os.cpus().length || 1;
+    /** 最近一次全表快照，供只读查询复用 */
+    this.lastSnapshot = null;
+    /** node 进程详情（命令行/启动时间）缓存，按需查询 */
+    this._nodeDetail = null;
+    /** 降级模式下的 node 进程枚举缓存与 CPU 基线 */
+    this._nodeList = null;
+    this._nodeBasicPrev = null;
   }
 
   get providerLabel() {
@@ -277,6 +284,16 @@ export class ProcessSampler {
     this._prev = new Map([...full].map(([pid, row]) => [pid, { cpuSeconds: row.cpuSeconds, rss: row.rss }]));
     this._prevTs = ts;
 
+    // 保留最近一次全表快照，供「进程检测器」等只读查询复用，避免重复采集
+    this.lastSnapshot = {
+      processes: full,
+      cpuByPid,
+      ts,
+      cores: this.cores,
+      provider: this.provider,
+      treeSupported: this.treeSupported,
+    };
+
     return { processes: full, cpuByPid, ts, cores: this.cores, provider: this.provider, treeSupported: this.treeSupported };
   }
 
@@ -341,6 +358,113 @@ export class ProcessSampler {
     return result;
   }
 
+  /**
+   * 枚举本机所有 node 进程，供「进程检测器」使用。
+   *
+   * 与常规采样共用结果：Linux /proc、macOS ps、Windows WMI 这些能拿到全表的 provider
+   * 直接复用最近一次快照；只有在 Windows WMI 不可用的降级场景下，才用
+   * `Get-Process -Name node` 单独枚举（拿不到父子关系与命令行，但至少能看到进程）。
+   *
+   * @param {{ force?: boolean, ttlMs?: number }} [opts]
+   */
+  async listNodeProcesses({ force = false, ttlMs = 4000 } = {}) {
+    if (!force && this._nodeList && Date.now() - this._nodeList.ts < ttlMs) {
+      return this._nodeList;
+    }
+
+    const snap = this.lastSnapshot;
+    if (snap && this.treeSupported && snap.processes.size) {
+      this._nodeList = {
+        source: 'snapshot',
+        ts: snap.ts,
+        cores: snap.cores,
+        rows: [...snap.processes.values()].filter((r) => NODE_NAME_RE.test(r.name || '')),
+        cpuByPid: snap.cpuByPid,
+      };
+      return this._nodeList;
+    }
+
+    if (process.platform === 'win32') {
+      const basic = await nodeListViaBasic();
+      if (basic) {
+        const now = Date.now();
+        const prev = this._nodeBasicPrev;
+        const cpuByPid = new Map();
+        const dt = prev ? (now - prev.ts) / 1000 : 0;
+        for (const row of basic) {
+          const before = prev?.cpu.get(row.pid);
+          cpuByPid.set(
+            row.pid,
+            before !== undefined && dt > 0 && row.cpuSeconds >= before
+              ? (row.cpuSeconds - before) / dt
+              : 0,
+          );
+        }
+        this._nodeBasicPrev = { ts: now, cpu: new Map(basic.map((r) => [r.pid, r.cpuSeconds])) };
+        this._nodeList = { source: 'basic', ts: now, cores: this.cores, rows: basic, cpuByPid };
+        return this._nodeList;
+      }
+    }
+
+    this._nodeList = { source: 'none', ts: Date.now(), cores: this.cores, rows: [], cpuByPid: new Map() };
+    return this._nodeList;
+  }
+
+  /**
+   * 解析一批 PID 的进程名（用于端口冲突弹窗里「谁占用了这个端口」）。
+   * 优先用最近一次快照；快照里没有（例如降级模式下只含托管根进程）就单独查一次。
+   * @returns {Promise<Map<number, string>>}
+   */
+  async resolveProcessNames(pids = []) {
+    const want = [...new Set(pids.filter((p) => Number.isInteger(p) && p > 0))];
+    const out = new Map();
+    if (!want.length) return out;
+
+    const snap = this.lastSnapshot;
+    const missing = [];
+    for (const pid of want) {
+      const row = snap?.processes.get(pid);
+      if (row?.name) out.set(pid, row.name);
+      else missing.push(pid);
+    }
+    if (!missing.length) return out;
+
+    try {
+      if (process.platform === 'win32') {
+        const list = missing.join(',');
+        const script = [
+          `$rows = @(Get-Process -Id ${list} -ErrorAction SilentlyContinue |`,
+          '  Select-Object Id,ProcessName);',
+          'if ($rows.Count -eq 0) { "[]" } else { $rows | ConvertTo-Json -Compress }',
+        ].join(' ');
+        const res = await captureStdout(PS, psArgs(script), { timeoutMs: 15000 });
+        if (res.ok && res.text.trim()) {
+          let rows = JSON.parse(res.text);
+          if (!Array.isArray(rows)) rows = [rows];
+          for (const r of rows) {
+            const pid = Number(r.Id);
+            if (Number.isInteger(pid)) out.set(pid, String(r.ProcessName || ''));
+          }
+        }
+      } else if (process.platform === 'linux') {
+        for (const pid of missing) {
+          try {
+            out.set(pid, (await fsp.readFile(`/proc/${pid}/comm`, 'utf8')).trim());
+          } catch { /* 进程已退出 */ }
+        }
+      } else if (process.platform === 'darwin') {
+        const res = await captureStdout('/bin/ps', ['-axo', 'pid=,comm='], { timeoutMs: 12000 });
+        if (res.ok) {
+          for (const line of res.text.split('\n')) {
+            const m = line.trim().match(/^(\d+)\s+(.*)$/);
+            if (m && missing.includes(Number(m[1]))) out.set(Number(m[1]), path.basename(m[2].trim()));
+          }
+        }
+      }
+    } catch { /* 解析不到就留空，不影响占用判定 */ }
+    return out;
+  }
+
   hostMetrics() {
     const cpus = os.cpus();
     let idle = 0;
@@ -380,4 +504,145 @@ export class ProcessSampler {
       sampledAt: new Date().toISOString(),
     };
   }
+
+  /**
+   * 按需查询 node 进程的「细节」：命令行、启动时间、可执行文件路径。
+   *
+   * 这些字段比 CPU/内存重得多，所以不放进 3s 常规采样，而是由「进程检测器」
+   * 单独触发，并按 TTL 缓存。各平台能力不同，拿不到就返回 null 字段（如实降级）。
+   *
+   * @param {{ force?: boolean, ttlMs?: number, pids?: number[] }} [opts]
+   * @returns {Promise<Map<number, {commandLine:string|null, startedAt:string|null, exePath:string|null}>>}
+   */
+  async queryNodeProcessDetails({ force = false, ttlMs = 15000, pids = null } = {}) {
+    if (!force && this._nodeDetail && Date.now() - this._nodeDetail.ts < ttlMs) {
+      return this._nodeDetail.map;
+    }
+    let map = new Map();
+    try {
+      if (process.platform === 'win32' && this.provider === 'wmi') {
+        map = await nodeDetailViaWmi();
+      } else if (process.platform === 'linux') {
+        map = await nodeDetailViaProc(pids || [...(this.lastSnapshot?.processes.keys() ?? [])]);
+      } else if (process.platform === 'darwin') {
+        map = await nodeDetailViaPs();
+      }
+    } catch {
+      map = new Map();
+    }
+    this._nodeDetail = { ts: Date.now(), map };
+    return map;
+  }
 }
+
+/* -------------------- node 进程细节（命令行等） --------------------------- */
+
+const NODE_NAME_RE = /^node(\.exe)?$/i;
+
+/** 降级枚举：Get-Process 不需要 WMI 权限，任何 Windows 账户都可用 */
+async function nodeListViaBasic() {
+  const script = [
+    '$rows = @(Get-Process -Name node -ErrorAction SilentlyContinue |',
+    '  Select-Object Id,ProcessName,WorkingSet64,CPU);',
+    'if ($rows.Count -eq 0) { "[]" } else { $rows | ConvertTo-Json -Compress -Depth 3 }',
+  ].join(' ');
+  const res = await captureStdout(PS, psArgs(script), { timeoutMs: 20000 });
+  if (!res.ok || !res.text.trim()) return null;
+  let rows;
+  try {
+    rows = JSON.parse(res.text);
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(rows)) rows = [rows];
+  return rows
+    .map((r) => ({
+      pid: Number(r.Id),
+      ppid: 0,
+      name: 'node',
+      rss: Number(r.WorkingSet64) || 0,
+      cpuSeconds: Number(r.CPU) || 0,
+    }))
+    .filter((r) => Number.isInteger(r.pid) && r.pid > 0);
+}
+
+/** CIM 时间戳 20261016122304.123456+480 → ISO 字符串 */
+function cimDateToIso(raw) {
+  const m = String(raw || '').match(/^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})/);
+  if (!m) return null;
+  const d = new Date(`${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6]}`);
+  return Number.isNaN(d.getTime()) ? null : d.toISOString();
+}
+
+async function nodeDetailViaWmi() {
+  const script = [
+    '$rows = @(Get-CimInstance Win32_Process -Filter "Name LIKE \'node%\'" -Property ProcessId,CommandLine,ExecutablePath,CreationDate |',
+    '  ForEach-Object { [pscustomobject]@{ pid=[int]$_.ProcessId; cmd=[string]$_.CommandLine;',
+    '    exe=[string]$_.ExecutablePath; created=[string]$_.CreationDate } });',
+    'if ($rows.Count -eq 0) { "[]" } else { $rows | ConvertTo-Json -Compress -Depth 3 }',
+  ].join(' ');
+  const res = await captureStdout(PS, psArgs(script), { timeoutMs: 25000 });
+  const map = new Map();
+  if (!res.ok || !res.text.trim()) return map;
+  let rows;
+  try {
+    rows = JSON.parse(res.text);
+  } catch {
+    return map;
+  }
+  if (!Array.isArray(rows)) rows = [rows];
+  for (const r of rows) {
+    const pid = Number(r.pid);
+    if (!Number.isInteger(pid)) continue;
+    map.set(pid, {
+      commandLine: r.cmd ? String(r.cmd) : null,
+      exePath: r.exe ? String(r.exe) : null,
+      startedAt: cimDateToIso(r.created),
+    });
+  }
+  return map;
+}
+
+async function nodeDetailViaProc(pids) {
+  const map = new Map();
+  for (const pid of pids) {
+    if (!Number.isInteger(pid) || pid <= 0) continue;
+    let commandLine = null;
+    let exePath = null;
+    let startedAt = null;
+    try {
+      const raw = (await fsp.readFile(`/proc/${pid}/cmdline`)).toString('utf8');
+      commandLine = raw.split('\0').filter(Boolean).join(' ').trim() || null;
+    } catch { /* 进程已退出 */ }
+    try {
+      exePath = await fsp.readlink(`/proc/${pid}/exe`);
+    } catch { /* 可能无权读取 */ }
+    try {
+      const stat = await fsp.stat(`/proc/${pid}`);
+      startedAt = stat.mtime.toISOString();
+    } catch { /* ignore */ }
+    if (commandLine || exePath) map.set(pid, { commandLine, exePath, startedAt });
+  }
+  return map;
+}
+
+async function nodeDetailViaPs() {
+  const res = await captureStdout('/bin/ps', ['-axo', 'pid=,lstart=,command='], { timeoutMs: 15000 });
+  const map = new Map();
+  if (!res.ok || !res.text) return map;
+  for (const line of res.text.split('\n')) {
+    const m = line.trim().match(/^(\d+)\s+(.{24})\s+(.*)$/);
+    if (!m) continue;
+    const cmd = m[3];
+    const base = cmd.split(/\s+/)[0] || '';
+    if (!/(^|[\\/])node(\.exe)?$/.test(base) && !/node/.test(base)) continue;
+    const d = new Date(m[2]);
+    map.set(Number(m[1]), {
+      commandLine: cmd,
+      exePath: base,
+      startedAt: Number.isNaN(d.getTime()) ? null : d.toISOString(),
+    });
+  }
+  return map;
+}
+

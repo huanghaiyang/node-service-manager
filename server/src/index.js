@@ -158,6 +158,11 @@ async function sampleOnce() {
       agg.sampledAt = new Date(ts).toISOString();
       // 端口按「该服务实际归属的进程集合」取（进程树支持时含子进程）
       agg.ports = portScanner.pick(agg.processes.map((p) => p.pid));
+      // 再逐个进程标出它自己监听的端口：monorepo 里一眼看出哪个子进程起了、占哪个端口
+      for (const proc of agg.processes) {
+        const own = portScanner.pick([proc.pid]);
+        if (own.length) proc.ports = own;
+      }
       lastMetrics.set(id, agg);
       pushHistory(id, { ts, ...agg });
     }
@@ -174,15 +179,98 @@ async function sampleOnce() {
 
 async function snapshotPayload() {
   const host = sampler.hostMetrics();
+  const services = store.list().map((s) => serviceView(s));
+  // 顶栏徽标用的轻量汇总（复用检测器的缓存，不额外采集）
+  const nodeSummary = await (async () => {
+    try {
+      const listing = await sampler.listNodeProcesses({ ttlMs: 8000 });
+      let managed = 0;
+      for (const row of listing.rows) if (managedMatchFor(row.pid)) managed += 1;
+      return { total: listing.rows.length, managed, source: listing.source };
+    } catch {
+      return { total: 0, managed: 0, source: 'none' };
+    }
+  })();
   return {
     ts: Date.now(),
     host,
-    services: store.list().map((s) => serviceView(s)),
+    nodeSummary,
+    services,
   };
 }
 
 /** 采样并推送 */
 let sampleTimer = null;
+
+/* --------------------------- Node 进程检测器 ------------------------------ */
+
+/** 该 pid 是否属于某个已托管服务（根进程或进程树成员） */
+function managedMatchFor(pid) {
+  for (const svc of store.list()) {
+    const st = pm.stateOf(svc.id);
+    if (st.pid === pid) return { serviceId: svc.id, serviceName: svc.name, matchedBy: 'pid', role: 'root' };
+  }
+  for (const svc of store.list()) {
+    const members = lastMetrics.get(svc.id)?.processes;
+    if (members?.some((p) => p.pid === pid)) {
+      return { serviceId: svc.id, serviceName: svc.name, matchedBy: 'pid', role: 'member' };
+    }
+  }
+  return null;
+}
+
+/** 服务根目录（归一化），用于按命令行/工作目录反查归属 */
+function managedRoots() {
+  const norm = (p) => String(p || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+  return store.list().map((svc) => ({
+    id: svc.id,
+    name: svc.name,
+    roots: [norm(svc.cwd), norm(svc.root)].filter(Boolean),
+  }));
+}
+
+/** 从命令行里找出它属于哪个托管服务（用于识别不是我们直接拉起的子进程） */
+function matchByCommandLine(commandLine) {
+  if (!commandLine) return null;
+  const hay = String(commandLine).replace(/\\/g, '/').toLowerCase();
+  let best = null;
+  for (const svc of managedRoots()) {
+    for (const root of svc.roots) {
+      if (root && hay.includes(root) && (!best || root.length > best.len)) {
+        best = { serviceId: svc.id, serviceName: svc.name, matchedBy: 'commandline', role: 'related', len: root.length };
+      }
+    }
+  }
+  if (!best) return null;
+  return { serviceId: best.serviceId, serviceName: best.serviceName, matchedBy: best.matchedBy, role: best.role };
+}
+
+/** 组装 node 进程列表（优先复用常规采样结果，降级时才单独枚举） */
+async function buildNodeProcessList({ details = null, force = false } = {}) {
+  const listing = await sampler.listNodeProcesses({ force });
+  const list = [];
+  for (const row of listing.rows) {
+    const match = managedMatchFor(row.pid)
+      || matchByCommandLine(details?.get(row.pid)?.commandLine)
+      || null;
+    list.push({
+      pid: row.pid,
+      ppid: row.ppid || 0,
+      name: row.name || 'node',
+      memoryBytes: row.rss || 0,
+      cpuPercent: ((listing.cpuByPid.get(row.pid) || 0) / (listing.cores || 1)) * 100,
+      cpuPercentPerCore: (listing.cpuByPid.get(row.pid) || 0) * 100,
+      ports: portScanner.pick([row.pid]),
+      commandLine: details?.get(row.pid)?.commandLine ?? null,
+      exePath: details?.get(row.pid)?.exePath ?? null,
+      startedAt: details?.get(row.pid)?.startedAt ?? null,
+      managed: Boolean(match),
+      ...(match || { serviceId: null, serviceName: null, matchedBy: null, role: null }),
+    });
+  }
+  list.sort((a, b) => Number(b.managed) - Number(a.managed) || b.memoryBytes - a.memoryBytes);
+  return { list, source: listing.source };
+}
 
 /**
  * 服务刚 spawn 时补采一次，尽量让卡片在「启动中」就能显示内存与进程数，
@@ -397,10 +485,95 @@ app.delete('/api/services/:id', wrap(async (req, res) => {
 
 /* ---- 生命周期控制 ---- */
 
+/**
+ * 启动前预检：目标端口是否已被占用。
+ * 只在服务未运行时才有意义（服务自己在跑时它的端口当然「被占用」）。
+ * 端口来源优先级：显式 ?port > 服务配置 port > 上次实际探测到的 TCP 端口。
+ */
+app.get('/api/services/:id/preflight', wrap(async (req, res) => {
+  const svc = requireService(req);
+  const st = pm.stateOf(svc.id);
+  const explicit = Number(req.query.port);
+  const detected = (lastMetrics.get(svc.id)?.ports || []).filter((p) => p.proto === 'tcp');
+  const candidate = Number.isInteger(explicit) && explicit > 0 ? explicit
+    : (svc.port || detected[0]?.port || null);
+
+  if (!candidate) {
+    res.json({
+      ok: true,
+      checked: false,
+      reason: 'no-port',
+      message: '未配置端口，且上一次运行未探测到监听端口，无法预检',
+      serviceId: svc.id,
+    });
+    return;
+  }
+  if (st.pid) {
+    res.json({
+      ok: true,
+      checked: false,
+      reason: 'running',
+      port: candidate,
+      message: '服务已在运行，跳过端口预检',
+      serviceId: svc.id,
+    });
+    return;
+  }
+
+  const inspection = await portScanner.inspectPort(candidate);
+  if (!inspection.occupied) {
+    res.json({ ok: true, ...inspection, serviceId: svc.id, occupants: [] });
+    return;
+  }
+
+  // 占用者信息：PID → 进程名，并判断是不是另一个被托管服务
+  const names = await sampler.resolveProcessNames((inspection.occupants || []).map((o) => o.pid)).catch(() => new Map());
+  const occupants = (inspection.occupants || []).map((o) => {
+    const snapRow = sampler.lastSnapshot?.processes.get(o.pid);
+    const owner = managedMatchFor(o.pid);
+    return {
+      pid: o.pid,
+      port: o.port,
+      address: o.address,
+      proto: o.proto,
+      name: names.get(o.pid) || snapRow?.name || null,
+      memoryBytes: snapRow?.rss || 0,
+      commandLine: null,
+      managedServiceId: owner?.serviceId || null,
+      managedServiceName: owner?.serviceName || null,
+    };
+  });
+
+  // 补上占用者的命令行（一次针对性查询，失败就算了）
+  try {
+    const nodePids = occupants.filter((o) => /^node(\.exe)?$/i.test(o.name || '')).map((o) => o.pid);
+    if (nodePids.length) {
+      const details = await sampler.queryNodeProcessDetails({ pids: nodePids });
+      for (const o of occupants) o.commandLine = details.get(o.pid)?.commandLine || null;
+    }
+  } catch { /* 拿不到命令行不影响占用判定 */ }
+
+  const suggestion = await PortScanner.findFreePort();
+  res.json({
+    ok: true,
+    ...inspection,
+    serviceId: svc.id,
+    occupants,
+    suggestion,
+    declaredPort: svc.port || null,
+  });
+}));
+
 app.post('/api/services/:id/start', wrap(async (req, res) => {
   requireService(req);
-  const state = await pm.start(req.params.id);
-  res.json({ ok: true, state });
+  const port = Number(req.body?.port);
+  const portOverride = Number.isInteger(port) && port > 0 ? port : null;
+  const persistPort = req.body?.persistPort === true;
+  if (persistPort && portOverride) {
+    store.update(req.params.id, { port: portOverride });
+  }
+  const state = await pm.start(req.params.id, { portOverride });
+  res.json({ ok: true, state, appliedPort: state.effectivePort ?? null });
 }));
 
 app.post('/api/services/:id/stop', wrap(async (req, res) => {
@@ -412,8 +585,40 @@ app.post('/api/services/:id/stop', wrap(async (req, res) => {
 
 app.post('/api/services/:id/restart', wrap(async (req, res) => {
   requireService(req);
-  const state = await pm.restart(req.params.id);
-  res.json({ ok: true, state });
+  const port = Number(req.body?.port);
+  const portOverride = Number.isInteger(port) && port > 0 ? port : null;
+  const state = await pm.restart(req.params.id, { portOverride });
+  res.json({ ok: true, state, appliedPort: state.effectivePort ?? null });
+}));
+
+/* ---- Node 进程检测器 ---- */
+
+app.get('/api/processes/node', wrap(async (req, res) => {
+  const wantRefresh = req.query.refresh === '1' || req.query.refresh === 'true';
+  const wantDetail = req.query.detail !== '0';
+  if (wantRefresh) {
+    await sampleOnce();
+    await portScanner.refresh().catch(() => {});
+  } else if (!sampler.lastSnapshot) {
+    await sampleOnce();
+  }
+  const details = wantDetail
+    ? await sampler.queryNodeProcessDetails({ force: wantRefresh }).catch(() => null)
+    : null;
+  const { list: processes, source } = await buildNodeProcessList({ details, force: wantRefresh });
+  res.json({
+    ok: true,
+    sampledAt: sampler.lastSnapshot ? new Date(sampler.lastSnapshot.ts).toISOString() : null,
+    portSampledAt: portScanner.sampledAt ? new Date(portScanner.sampledAt).toISOString() : null,
+    enumerateSource: source,
+    detailAvailable: Boolean(details && details.size),
+    metricsProvider: sampler.provider,
+    metricsTreeSupported: sampler.treeSupported,
+    portProvider: portScanner.provider,
+    total: processes.length,
+    managedCount: processes.filter((p) => p.managed).length,
+    processes,
+  });
 }));
 
 app.post('/api/services/:id/kill-orphan', wrap(async (req, res) => {

@@ -206,7 +206,7 @@ const version = computed(() => pkgInfo.value?.version || '');
           <div class="section-title">进程详情（{{ metrics?.processCount ?? 0 }} 个进程 · {{ metrics?.scope === 'tree' ? '进程树' : '仅主进程' }}）</div>
           <table class="plain">
             <thead>
-              <tr><th>PID</th><th>进程名</th><th>角色</th><th class="num">内存</th><th class="num">CPU</th></tr>
+              <tr><th>PID</th><th>进程名</th><th>角色</th><th>监听端口</th><th class="num">内存</th><th class="num">CPU</th></tr>
             </thead>
             <tbody>
               <tr v-for="p in (metrics?.processes || [])" :key="p.pid">
@@ -216,14 +216,33 @@ const version = computed(() => pkgInfo.value?.version || '');
                   <span v-if="p.isRoot" class="tag green">主进程</span>
                   <span v-else class="tag">子进程</span>
                 </td>
+                <td>
+                  <template v-if="p.ports?.length">
+                    <a
+                      v-for="x in p.ports"
+                      :key="`${x.proto}-${x.port}`"
+                      class="tag blue"
+                      style="text-decoration: none; margin-right: 4px"
+                      :href="`http://127.0.0.1:${x.port}/`"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      :title="`${x.address}:${x.port}（${x.proto.toUpperCase()}）—— 点击在浏览器打开`"
+                    >:{{ x.port }} ↗</a>
+                  </template>
+                  <span v-else class="muted">—</span>
+                </td>
                 <td class="num">{{ formatBytes(p.rss) }}</td>
                 <td class="num">{{ formatPercent(p.cpuPercent, 2) }}</td>
               </tr>
               <tr v-if="!metrics?.processes?.length">
-                <td colspan="5" class="muted" style="text-align: center; padding: 16px">服务未运行</td>
+                <td colspan="6" class="muted" style="text-align: center; padding: 16px">服务未运行</td>
               </tr>
             </tbody>
           </table>
+          <div v-if="(metrics?.processes?.length || 0) > 1" class="hint" style="margin-top: 8px">
+            该服务由多个进程组成（例如 concurrently / pnpm 并行启动的前后端），
+            上面列出了每个子进程各自监听的端口，可直接点击打开。
+          </div>
 
           <div class="section-title">package.json</div>
           <table class="plain">

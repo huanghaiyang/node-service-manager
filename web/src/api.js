@@ -40,11 +40,16 @@ export const api = {
   update: (id, patch) => request(`/api/services/${id}`, { method: 'PATCH', body: patch }),
   remove: (id, force = true) => request(`/api/services/${id}`, { method: 'DELETE', query: { force } }),
 
-  start: (id) => request(`/api/services/${id}/start`, { method: 'POST', body: {} }),
+  start: (id, opts = {}) => request(`/api/services/${id}/start`, { method: 'POST', body: opts }),
   stop: (id, force = false) => request(`/api/services/${id}/stop`, { method: 'POST', body: { force } }),
-  restart: (id) => request(`/api/services/${id}/restart`, { method: 'POST', body: {} }),
+  restart: (id, opts = {}) => request(`/api/services/${id}/restart`, { method: 'POST', body: opts }),
   killOrphan: (id) => request(`/api/services/${id}/kill-orphan`, { method: 'POST', body: {} }),
   plan: (id) => request(`/api/services/${id}/plan`),
+  /** 启动前端口预检：目标端口是否被占用、占用者是谁、随机可用端口 */
+  preflight: (id, port) => request(`/api/services/${id}/preflight`, { query: { port } }),
+
+  /** Node 进程检测器 */
+  nodeProcesses: (refresh = false) => request('/api/processes/node', { query: { refresh: refresh ? 1 : undefined } }),
 
   startAll: () => request('/api/services/start-all', { method: 'POST', body: {} }),
   stopAll: () => request('/api/services/stop-all', { method: 'POST', body: {} }),
