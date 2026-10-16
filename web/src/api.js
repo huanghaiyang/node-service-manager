@@ -1,0 +1,77 @@
+const BASE = import.meta.env.VITE_API_BASE || '';
+
+async function request(path, { method = 'GET', body, query } = {}) {
+  let url = `${BASE}${path}`;
+  if (query) {
+    const qs = new URLSearchParams(
+      Object.entries(query).filter(([, v]) => v !== undefined && v !== null && v !== ''),
+    ).toString();
+    if (qs) url += (url.includes('?') ? '&' : '?') + qs;
+  }
+  let res;
+  try {
+    res = await fetch(url, {
+      method,
+      headers: body ? { 'content-type': 'application/json' } : undefined,
+      body: body ? JSON.stringify(body) : undefined,
+    });
+  } catch (err) {
+    throw Object.assign(new Error(`无法连接治理服务端：${err.message}`), { code: 'NETWORK' });
+  }
+  const text = await res.text();
+  let json = null;
+  try { json = text ? JSON.parse(text) : null; } catch { /* 非 JSON 响应 */ }
+  if (!res.ok) {
+    throw Object.assign(new Error(json?.message || `请求失败（HTTP ${res.status}）`), {
+      code: json?.code || `HTTP_${res.status}`,
+      status: res.status,
+    });
+  }
+  return json;
+}
+
+export const api = {
+  health: () => request('/api/health'),
+  system: () => request('/api/system'),
+
+  list: () => request('/api/services'),
+  get: (id) => request(`/api/services/${id}`),
+  create: (payload) => request('/api/services', { method: 'POST', body: payload }),
+  update: (id, patch) => request(`/api/services/${id}`, { method: 'PATCH', body: patch }),
+  remove: (id, force = true) => request(`/api/services/${id}`, { method: 'DELETE', query: { force } }),
+
+  start: (id) => request(`/api/services/${id}/start`, { method: 'POST', body: {} }),
+  stop: (id, force = false) => request(`/api/services/${id}/stop`, { method: 'POST', body: { force } }),
+  restart: (id) => request(`/api/services/${id}/restart`, { method: 'POST', body: {} }),
+  killOrphan: (id) => request(`/api/services/${id}/kill-orphan`, { method: 'POST', body: {} }),
+  plan: (id) => request(`/api/services/${id}/plan`),
+
+  startAll: () => request('/api/services/start-all', { method: 'POST', body: {} }),
+  stopAll: () => request('/api/services/stop-all', { method: 'POST', body: {} }),
+
+  logs: (id, limit = 800) => request(`/api/services/${id}/logs`, { query: { limit } }),
+  clearLogs: (id) => request(`/api/services/${id}/logs`, { method: 'DELETE' }),
+
+  roots: () => request('/api/fs/roots'),
+  listDir: (path) => request('/api/fs/list', { query: { path } }),
+  analyze: (packageJsonPath) => request('/api/package/analyze', { method: 'POST', body: { packageJsonPath } }),
+  scan: (dir, depth = 2) => request('/api/scan', { method: 'POST', body: { dir, depth } }),
+};
+
+/** SSE 订阅，返回关闭函数 */
+export function subscribe(handlers) {
+  const es = new EventSource(`${BASE}/api/events`);
+  const bind = (name) => (ev) => {
+    let data = null;
+    try { data = JSON.parse(ev.data); } catch { /* ignore */ }
+    handlers[name]?.(data);
+  };
+  es.addEventListener('hello', bind('hello'));
+  es.addEventListener('snapshot', bind('snapshot'));
+  es.addEventListener('log', bind('log'));
+  es.addEventListener('status', bind('status'));
+  es.addEventListener('services-changed', bind('servicesChanged'));
+  es.onopen = () => handlers.open?.();
+  es.onerror = () => handlers.error?.();
+  return () => es.close();
+}

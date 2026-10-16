@@ -1,0 +1,23 @@
+{
+  "name": "service-manager",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Node 服务治理工具：定位 package.json、托管启动/停止、监听运行状态、采集 CPU/内存",
+  "type": "module",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "start": "node server/src/index.js",
+    "dev": "node scripts/dev.mjs",
+    "dev:server": "node --watch server/src/index.js",
+    "build": "node scripts/build-web.mjs",
+    "build:watch": "node scripts/build-web.mjs --watch",
+    "serve": "npm run build && node server/src/index.js",
+    "test:smoke": "node scripts/smoke-test.mjs"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "vue": "^3.5.13"
+  }
+}

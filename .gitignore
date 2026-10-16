@@ -1,0 +1,16 @@
+# 依赖与构建
+node_modules/
+dist/
+
+# 运行期数据（服务清单、日志、临时文件）——不要提交
+data/
+
+# npm 本地缓存（沙箱内为绕开工作区外缓存而设置）
+.npm-cache/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log

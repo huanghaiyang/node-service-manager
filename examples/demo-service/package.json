@@ -1,0 +1,16 @@
+{
+  "name": "demo-service",
+  "version": "1.0.0",
+  "private": true,
+  "description": "用于验证服务治理工具的示例 Node 服务：周期性打印日志、占用少量 CPU 与内存",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node index.js --dev",
+    "build": "echo build-not-needed"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
