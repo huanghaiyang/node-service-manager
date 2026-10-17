@@ -384,6 +384,11 @@ export class ProcessManager extends EventEmitter {
 
     const env = {
       ...process.env,
+      // 默认关闭子进程的颜色输出：我们的 stdout 是文件而不是 TTY，但很多工具仍会输出
+      // ANSI 颜色码，直接展示就成了乱码。放在 svc.env 之前，服务级 env 仍可覆盖
+      // （例如想保留颜色就设 FORCE_COLOR=1）。
+      NO_COLOR: '1',
+      FORCE_COLOR: '0',
       ...svc.env,
       SM_MANAGED: '1',
       SM_SERVICE_ID: id,

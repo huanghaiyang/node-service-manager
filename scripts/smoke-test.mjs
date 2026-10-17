@@ -293,6 +293,59 @@ await new Promise((resolve) => crashSquat.close(resolve));
 await fs.promises.rm(crashAppDir, { recursive: true, force: true }).catch(() => {});
 await sleep(600);
 
+/* 9f. 日志清洗：子进程输出的 ANSI 颜色码 / 光标控制 / \r 进度条都要变成可读纯文本
+       （vite、npm、webpack 等在被重定向到文件后仍会输出颜色码，直接显示就是乱码） */
+const ansiAppDir = path.join(os.tmpdir(), 'sm-ansi-app');
+await fs.promises.mkdir(ansiAppDir, { recursive: true });
+await fs.promises.writeFile(
+  path.join(ansiAppDir, 'package.json'),
+  JSON.stringify({ name: 'sm-ansi-app', version: '1.0.0', private: true, type: 'module', scripts: { start: 'node index.js' } }, null, 2),
+  'utf8',
+);
+await fs.promises.writeFile(
+  path.join(ansiAppDir, 'index.js'),
+  [
+    "const E = '\\u001b';",
+    "console.log(`${E}[2m16:03:52${E}[22m ${E}[36m${E}[1m[vite]${E}[22m${E}[39m ${E}[90m${E}[2m(client)${E}[22m${E}[39m ${E}[32mhmr update${E}[39m`);",
+    "console.log(`${E}[31m红色${E}[0m ${E}[42m绿底${E}[0m 普通文字`);",
+    "console.log(`before${E}[2K${E}[1Gafter-clear-line`);",
+    "process.stdout.write('构建中 10%\\r');",
+    "process.stdout.write('构建中 100%\\n');",
+    "console.log(`NO_COLOR=${process.env.NO_COLOR} FORCE_COLOR=${process.env.FORCE_COLOR}`);",
+    'setInterval(() => {}, 1000);',
+    '',
+  ].join('\n'),
+  'utf8',
+);
+
+const ansiSvc = await api('/api/services', {
+  method: 'POST',
+  body: { packageJsonPath: path.join(ansiAppDir, 'package.json'), name: 'sm-ansi-app' },
+});
+const ansiId = ansiSvc.json?.service?.id;
+if (ansiId) {
+  await api(`/api/services/${ansiId}/start`, { method: 'POST', body: {} });
+  await sleep(3000);
+  const ansiLogs = (await api(`/api/services/${ansiId}/logs?limit=200`)).json?.lines || [];
+  const ansiOut = ansiLogs.filter((l) => l.stream === 'stdout');
+  const ansiText = ansiOut.map((l) => l.text).join('\n');
+  check('日志中不含 ANSI 控制字节', !/[\u001B\u009B]/.test(ansiText),
+    ansiOut.find((l) => /[\u001B\u009B]/.test(l.text))?.text || '无');
+  check('ANSI 颜色码被还原为纯文本', ansiOut.some((l) => l.text === '16:03:52 [vite] (client) hmr update'),
+    ansiOut.find((l) => l.text.includes('[vite]'))?.text || '未找到 vite 行');
+  check('光标控制序列被清除', ansiOut.some((l) => l.text === 'beforeafter-clear-line'),
+    ansiOut.find((l) => l.text.startsWith('before'))?.text || '未找到');
+  check('\\r 进度条只保留最终状态', ansiOut.some((l) => l.text === '构建中 100%')
+    && !ansiOut.some((l) => l.text.includes('构建中 10%')),
+    JSON.stringify(ansiOut.filter((l) => l.text.includes('构建中')).map((l) => l.text)));
+  check('默认向子进程注入 NO_COLOR / FORCE_COLOR', ansiOut.some((l) => /NO_COLOR=1 FORCE_COLOR=0/.test(l.text)),
+    ansiOut.find((l) => l.text.startsWith('NO_COLOR'))?.text || '未找到');
+  await api(`/api/services/${ansiId}/stop`, { method: 'POST', body: { force: true } });
+  await api(`/api/services/${ansiId}?force=true`, { method: 'DELETE' });
+}
+await fs.promises.rm(ansiAppDir, { recursive: true, force: true }).catch(() => {});
+await sleep(400);
+
 /* 10. 目录定位能力 */
 const parent = await api('/api/fs/list?path=' + encodeURIComponent(EXAMPLES_DIR));
 check('目录浏览：列出子目录', parent.ok && (parent.json?.dirs?.length || 0) > 0,

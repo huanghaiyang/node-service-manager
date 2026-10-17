@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { LOG_DIR, LOG_BUFFER_LINES, LOG_FILE_MAX_BYTES, ensureDirs } from './config.js';
+import { sanitizeLogLine } from './util.js';
 
 /**
  * 服务日志：子进程 stdout/stderr 直接写入文件（文件描述符 stdio），
@@ -173,13 +174,25 @@ export class LogStore {
     const lines = combined.split(/\r?\n/);
     st.partial[stream] = lines.pop() ?? '';
     for (const line of lines) {
-      this._push(st, { ts: new Date().toISOString(), stream: stream === 'out' ? 'stdout' : 'stderr', text: line });
+      this._pushLine(st, stream, line);
     }
     // 超长单行（无换行）也及时展示，避免看不到进度输出
     if (st.partial[stream].length > 8192) {
-      this._push(st, { ts: new Date().toISOString(), stream: stream === 'out' ? 'stdout' : 'stderr', text: st.partial[stream] });
+      this._pushLine(st, stream, st.partial[stream]);
       st.partial[stream] = '';
     }
+  }
+
+  /** 清洗并压入一行日志：去 ANSI 颜色码 / 控制字符，处理 \r 覆盖 */
+  _pushLine(st, stream, rawLine) {
+    const text = sanitizeLogLine(rawLine);
+    // 整行只有一个颜色复位之类的转义序列时，清洗后为空 —— 丢掉，别在界面上留空行
+    if (!text && rawLine) return;
+    this._push(st, {
+      ts: new Date().toISOString(),
+      stream: stream === 'out' ? 'stdout' : 'stderr',
+      text,
+    });
   }
 
   _push(st, entry) {
@@ -249,7 +262,10 @@ export class LogStore {
       try {
         if (!fs.existsSync(file)) return;
         const lines = fs.readFileSync(file, 'utf8').split(/\r?\n/).filter((l) => l.length);
-        for (const line of lines.slice(-limit)) out.push({ ts: null, stream, text: line });
+        // 历史日志同样要清洗：文件里是子进程原始输出，可能带 ANSI 颜色码
+        for (const line of lines.slice(-limit)) {
+          out.push({ ts: null, stream, text: sanitizeLogLine(line) });
+        }
       } catch { /* ignore */ }
     };
 

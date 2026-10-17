@@ -67,6 +67,39 @@ export function nowIso() {
   return new Date().toISOString();
 }
 
+/**
+ * ANSI 转义序列。
+ * 覆盖三类：
+ *   CSI  ESC [ 参数 中间字节 终止字节   —— SGR 颜色（ESC[36m）、光标移动（ESC[2K）等
+ *   OSC  ESC ] ... BEL 或 ESC \         —— 设置窗口标题、超链接等
+ *   双字符转义 ESC <单字符>              —— 例如 ESC(B 切换字符集
+ * 子进程被重定向到文件后通常仍会输出颜色（很多工具只看是否设置了环境变量），
+ * 这些字节直接显示就成了「乱码」。
+ */
+const ANSI_RE = /[\u001B\u009B](?:\[[0-?]*[ -/]*[@-~]|\][^\u0007\u001B]*(?:\u0007|\u001B\\)|[@-_])/g;
+
+/** 去掉 ANSI 转义序列 */
+export function stripAnsi(text) {
+  return String(text ?? '').replace(ANSI_RE, '');
+}
+
+/**
+ * 日志行清洗：去 ANSI 控制符、去其它不可打印控制字符、并处理 \r 覆盖。
+ *
+ * 关于 \r：进度条（npm/vite/webpack）习惯用 \r 回到行首重复覆盖同一行，
+ * 终端最终只显示最后一段。这里对齐这个语义，否则会看到一堆拼在一起的内容。
+ */
+export function sanitizeLogLine(text) {
+  let s = stripAnsi(text);
+  if (s.includes('\r')) {
+    const parts = s.split('\r');
+    s = parts[parts.length - 1];
+  }
+  // 保留 \t，去掉其余控制字符（含 ESC 残留、退格、振铃等）
+  s = s.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '');
+  return s;
+}
+
 /** 进程是否存活（信号 0 探测） */
 export function isAlive(pid) {
   if (!pid || !Number.isInteger(pid) || pid <= 0) return false;
