@@ -188,6 +188,18 @@ npm run build && npm start
 > 当前后端代理目标写死在别处（例如 vite 的 `API_TARGET`）而两边不一致时，
 > 用治理工具统一端口是最省事的修法 —— 详见文末的排查案例。
 
+**崩溃后诊断**：如果端口冲突没被预检拦住（例如服务没配端口、或应用把端口写在代码里），
+进程会带着 `EADDRINUSE` 退出。此时工具会：
+
+1. 在进程退出时**强制把尚未轮询到的日志读完**（快速崩溃时 `exit` 事件往往早于 250ms 的日志轮询）；
+2. 从日志里认出 `EADDRINUSE` 与端口号（兼容 `127.0.0.1:8787`、`:::8787`、以及 stack 里的 `port: 8787`）；
+3. 反查占用者，并查明它是不是另一个托管服务；
+4. 卡片上直接给出可读结论与「换端口启动」按钮：
+
+   > ⚠ 端口 8787 已被托管服务「hunyuan3d-workbench」（PID 11528）占用　`[换端口启动]`
+
+同时这个端口会被记住，**下次点「启动」时预检直接拿它提前拦截**，不会让你再崩一次。
+
 ### 6. Node 进程检测器
 
 顶栏的「🖥 进程检测器」按钮会展开右侧栏（**默认隐藏**，开关状态记在浏览器本地）：
@@ -510,6 +522,43 @@ vite 只会把 `VITE_` 前缀的变量注入客户端，`vite.config.ts` 里的 
 
 这类问题现在可以更快定位：**进程检测器**会同时列出 `vite` 与 `tsx` 两个进程各自的监听端口，
 一眼就能看出「后端在 8786、前端在找 8787」。
+
+### 排查案例二：两个项目抢同一个默认端口
+
+`image-clip` 的后端起不来，日志里 `node --watch` 在无限重试：
+
+```
+[server] Error: listen EADDRINUSE: address already in use 127.0.0.1:8787
+[server] Failed running 'src/index.js'. Waiting for file changes before restarting...
+```
+
+| 证据 | 结论 |
+| --- | --- |
+| `image-clip/server/src/index.js`：`Number(process.env.PORT ?? 8787)` | 读 `PORT`，默认 **8787** |
+| `image-clip/web/vite.config.js`：`target: 'http://127.0.0.1:8787'` | 前端代理**写死** 8787 |
+| 进程检测器显示 8787 属于 `hunyuan3d-workbench` 的 `tsx watch src/index.ts` | 被**另一个托管服务**占了 |
+| `hunyuan3d-workbench` 的 `vite.config.ts` 同样默认 8787 | 两个项目都盯着 8787，谁先起谁占 |
+
+关键点：**不能只把 image-clip 的后端端口换掉**。它的前端代理写死 8787，
+换了端口之后前端会静默地去访问另一个服务（跨服务串台），比直接报错更难查。
+
+处理方式二选一：
+
+1. **不要同时跑**：先把 `hunyuan3d-workbench` 停掉，再启动 `image-clip`（两者都默认 8787）；
+2. **让前端代理跟着后端端口走**（各加一行，之后就能并行跑）：
+
+   ```js
+   // image-clip/web/vite.config.js
+   const API_PORT = process.env.PORT ?? 8787;
+   // ... proxy: { '/api': { target: `http://127.0.0.1:${API_PORT}`, changeOrigin: false } }
+   ```
+
+   然后在治理工具里给 `image-clip` 配一个空闲端口（例如 8788）。
+   我们会把 `PORT` 注入整棵进程树，`vite.config.js` 里的 `process.env.PORT` 就能读到它，
+   于是后端监听 8788、前端代理也指向 8788。
+
+> 这两次排查都印证了同一个模式：**前端代理目标与后端端口各改各的**。
+> 治理工具能统一注入 `PORT`，但前提是项目的 `vite.config` 读它，而不是写死。
 
 ### 其他常见问题
 

@@ -235,6 +235,36 @@ export function buildLaunchPlan(service) {
 
 /* ------------------------------ 进程管理器 --------------------------------- */
 
+/**
+ * 从日志尾部识别「端口被占用」并提取端口号。
+ *
+ * Node 生态里 EADDRINUSE 的呈现形式很杂：
+ *   Error: listen EADDRINUSE: address already in use 127.0.0.1:8787
+ *   Error: listen EADDRINUSE: address already in use :::8787
+ *   后面还可能跟着 stack 与 { address: '127.0.0.1', port: 8787 }
+ * 所以先定位 EADDRINUSE，再在它附近若干行里找端口号。
+ */
+export function detectPortInUse(lines) {
+  const text = (lines || []).map((l) => String(l?.text ?? l));
+  const start = text.findIndex((t) => /EADDRINUSE|address already in use/i.test(t));
+  if (start < 0) return null;
+  // 同一行里通常直接带端口：127.0.0.1:8787 / :::8787 / :8787
+  const inline = text[start].match(/:(\d{2,5})\b/);
+  if (inline) {
+    const port = Number(inline[1]);
+    if (port > 0 && port <= 65535) return port;
+  }
+  // 否则看后续 stack 里的 port: 8787
+  for (let i = start + 1; i < Math.min(text.length, start + 15); i += 1) {
+    const m = text[i].match(/port:\s*(\d{2,5})\b/);
+    if (m) {
+      const port = Number(m[1]);
+      if (port > 0 && port <= 65535) return port;
+    }
+  }
+  return null;
+}
+
 export class ProcessManager extends EventEmitter {
   /**
    * @param {import('./store.js').ServiceStore} store
@@ -269,6 +299,8 @@ export class ProcessManager extends EventEmitter {
       autoRestartScheduled: Boolean(s.autoRestartScheduled),
       // 本次运行实际注入的端口（可能来自端口冲突时的临时选择）
       effectivePort: s.effectivePort ?? null,
+      // 崩溃时识别出的被占用端口（由 API 层补充占用者信息）
+      crashPort: s.crashPort ?? null,
       alive,
       plan: s.plan || null,
       logPaths: this.logs.paths(id),
@@ -432,6 +464,19 @@ export class ProcessManager extends EventEmitter {
       const lifetime = Date.now() - startTs;
       const failed = !userStopped && (code !== 0 && code !== null);
       const status = userStopped ? STATUS.STOPPED : (failed ? STATUS.CRASHED : STATUS.EXITED);
+
+      // 失败退出时尝试从日志里认出「端口被占用」这类最常见、也最容易被误判为
+      // 「服务没起来」的原因，把端口号记进运行时状态，由 API 层补上占用者信息。
+      let crashPort = null;
+      if (failed) {
+        try {
+          // 先强制把日志文件里尚未被 tailer 轮询到的内容读出来：
+          // 快速崩溃时 exit 事件往往早于 250ms 的日志轮询，否则读到的尾部还是空的
+          this.logs.poll(id);
+          crashPort = detectPortInUse(this.logs.read(id, 80).lines);
+        } catch { /* 日志读取失败不影响状态机 */ }
+      }
+
       this.logs.append(
         id,
         userStopped
@@ -445,7 +490,10 @@ export class ProcessManager extends EventEmitter {
         stoppedAt: new Date().toISOString(),
         exitCode: code,
         signal: signal || null,
-        lastError: failed ? `进程异常退出（code=${code}）` : null,
+        lastError: failed
+          ? (crashPort ? `端口 ${crashPort} 已被占用，进程无法监听（EADDRINUSE）` : `进程异常退出（code=${code}）`)
+          : null,
+        crashPort,
         autoRestartScheduled: false,
         pendingStop: false,
       });

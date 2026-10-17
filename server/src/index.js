@@ -112,6 +112,8 @@ function serviceView(svc, { withHistory = true } = {}) {
     },
     history: withHistory ? (history.get(svc.id) || { ts: [], cpu: [], memory: [] }) : undefined,
     logBytes: logs.state.get(svc.id)?.bytes || { out: 0, err: 0 },
+    // 崩溃后诊断出的端口冲突（含占用者与推荐端口），UI 可直接一键换端口重试
+    portConflictHint: portConflictHints.get(svc.id) || null,
     managed: true,
   };
 }
@@ -245,6 +247,60 @@ function matchByCommandLine(commandLine) {
   return { serviceId: best.serviceId, serviceName: best.serviceName, matchedBy: best.matchedBy, role: best.role };
 }
 
+/**
+ * 组装「端口被谁占用」的完整信息：占用者 PID/进程名/所属托管服务 + 随机可用端口。
+ * 端口预检与崩溃诊断共用同一套逻辑。
+ */
+async function buildPortConflictInfo(port) {
+  const target = Number(port);
+  if (!Number.isInteger(target) || target <= 0) return null;
+  const inspection = await portScanner.inspectPort(target).catch(() => null);
+  const raw = inspection?.occupants || [];
+  const names = await sampler.resolveProcessNames(raw.map((o) => o.pid)).catch(() => new Map());
+  const occupants = raw.map((o) => {
+    const owner = managedMatchFor(o.pid);
+    return {
+      pid: o.pid,
+      port: o.port,
+      address: o.address,
+      proto: o.proto,
+      name: names.get(o.pid) || sampler.lastSnapshot?.processes.get(o.pid)?.name || null,
+      managedServiceId: owner?.serviceId || null,
+      managedServiceName: owner?.serviceName || null,
+    };
+  });
+  try {
+    const nodePids = occupants.filter((o) => /^node(\.exe)?$/i.test(o.name || '')).map((o) => o.pid);
+    if (nodePids.length) {
+      const details = await sampler.queryNodeProcessDetails({ pids: nodePids });
+      for (const o of occupants) o.commandLine = details.get(o.pid)?.commandLine || null;
+    }
+  } catch { /* 拿不到命令行不影响判定 */ }
+
+  const suggestion = await PortScanner.findFreePort().catch(() => null);
+  return {
+    port: target,
+    occupied: Boolean(inspection?.occupied),
+    via: inspection?.via || null,
+    occupants,
+    suggestion,
+    inspectedAt: new Date().toISOString(),
+  };
+}
+
+/** 一句话说清「谁占了这个端口」 */
+function describePortOccupant(info) {
+  const o = info?.occupants?.[0];
+  if (!o) return `端口 ${info?.port} 已被占用（未能定位占用者）`;
+  const who = o.managedServiceName
+    ? `托管服务「${o.managedServiceName}」`
+    : `进程 ${o.name || '(未知)'}`;
+  return `端口 ${info.port} 已被${who}（PID ${o.pid}）占用`;
+}
+
+/** 崩溃后识别出的端口冲突提示，按服务缓存 */
+const portConflictHints = new Map();
+
 /** 组装 node 进程列表（优先复用常规采样结果，降级时才单独枚举） */
 async function buildNodeProcessList({ details = null, force = false } = {}) {
   const listing = await sampler.listNodeProcesses({ force });
@@ -297,7 +353,21 @@ pm.on('status', (id, st) => {
     lastMetrics.delete(id);
   }
   // 进程一旦 spawn 就补采（此时内存/进程数已经有意义），不必等到 RUNNING 提升
-  if (st.status === STATUS.STARTING || st.status === STATUS.RUNNING) scheduleQuickSample(900);
+  if (st.status === STATUS.STARTING || st.status === STATUS.RUNNING) {
+    // 新一轮启动：上一轮的崩溃诊断作废
+    if (portConflictHints.delete(id)) broadcast('services-changed', { action: 'hint-cleared', id });
+    scheduleQuickSample(900);
+  }
+  // 崩溃且日志里读出了被占用的端口 → 补上「占用者是谁 + 推荐端口」，让用户一键换端口
+  if (st.status === STATUS.CRASHED && st.crashPort) {
+    buildPortConflictInfo(st.crashPort)
+      .then(async (info) => {
+        if (!info) return;
+        portConflictHints.set(id, { ...info, message: describePortOccupant(info) });
+        broadcast('snapshot', await snapshotPayload());
+      })
+      .catch((err) => console.warn('[crash-diagnose] 端口占用诊断失败:', err.message));
+  }
 });
 
 function startSamplingLoop() {
@@ -495,8 +565,11 @@ app.get('/api/services/:id/preflight', wrap(async (req, res) => {
   const st = pm.stateOf(svc.id);
   const explicit = Number(req.query.port);
   const detected = (lastMetrics.get(svc.id)?.ports || []).filter((p) => p.proto === 'tcp');
+  // 候选端口优先级：显式指定 > 服务配置 > 上次实际监听 > 上次崩溃时撞到的端口。
+  // 最后一项很关键：像 image-clip 这种端口写在代码里、配置为空的服务，
+  // 第一次崩溃后我们就记住了它想用哪个端口，第二次点「启动」就能提前弹窗而不是再崩一次。
   const candidate = Number.isInteger(explicit) && explicit > 0 ? explicit
-    : (svc.port || detected[0]?.port || null);
+    : (svc.port || detected[0]?.port || st.crashPort || null);
 
   if (!candidate) {
     res.json({

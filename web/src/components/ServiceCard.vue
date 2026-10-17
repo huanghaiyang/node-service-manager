@@ -1,7 +1,7 @@
 <script setup>
 import { computed } from 'vue';
 import Sparkline from './Sparkline.vue';
-import { actions } from '../store.js';
+import { actions, openPortConflictForHint } from '../store.js';
 import {
   formatBytes, formatPercent, formatUptime, shortenPath, STATUS_META, ENTRY_SOURCE_META,
 } from '../format.js';
@@ -130,7 +130,18 @@ const hasEntry = computed(() => Boolean(entry.value.url));
       <div v-if="hasEntry" class="entry-url ellipsis mono" :title="entry.url">{{ entry.url }}</div>
     </div>
 
-    <div v-if="st.lastError" class="banner warn">
+    <!-- 崩溃诊断：后端从日志里认出 EADDRINUSE，并查明了占用者，直接给一键换端口 -->
+    <div v-if="service.portConflictHint" class="banner err">
+      <span>⚠</span>
+      <span class="grow">
+        {{ service.portConflictHint.message }}
+        <template v-if="service.portConflictHint.occupants?.[0]?.managedServiceName === service.name">
+          —— 疑似该服务上一次的残留进程
+        </template>
+      </span>
+      <button class="btn danger sm" :disabled="busy" @click="openPortConflictForHint(service)">换端口启动</button>
+    </div>
+    <div v-else-if="st.lastError" class="banner warn">
       <span>⚠</span><span class="grow">{{ st.lastError }}</span>
     </div>
 

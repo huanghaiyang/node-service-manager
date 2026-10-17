@@ -225,6 +225,27 @@ export async function startService(svc) {
   return launchService(svc);
 }
 
+/**
+ * 服务因端口冲突崩溃后，用后端诊断出的占用信息直接打开换端口对话框。
+ * 这样「后端起不来」不再需要用户自己去 netstat 找原因。
+ */
+export function openPortConflictForHint(svc) {
+  const hint = svc?.portConflictHint;
+  if (!hint) return;
+  state.portConflict = {
+    service: svc,
+    info: {
+      checked: true,
+      occupied: true,
+      port: hint.port,
+      occupants: hint.occupants || [],
+      suggestion: hint.suggestion,
+      fromCrash: true,
+      message: hint.message,
+    },
+  };
+}
+
 export const actions = {
   start: (svc) => startService(svc),
   stop: (svc) => run(() => api.stop(svc.id), { okMessage: `已停止 ${svc.name}` }),

@@ -6,6 +6,8 @@
  */
 import path from 'node:path';
 import net from 'node:net';
+import os from 'node:os';
+import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 const EXAMPLES_DIR = fileURLToPath(new URL('../examples', import.meta.url));
@@ -227,6 +229,68 @@ check('检测器返回枚举来源与占用信息', Boolean(det.enumerateSource)
 
 await api(`/api/services/${id}/stop`, { method: 'POST', body: { force: true } });
 await new Promise((resolve) => squatter.close(resolve));
+await sleep(600);
+
+/* 9e. 崩溃诊断：应用自己绑 127.0.0.1 且端口被占 → 认出 EADDRINUSE 端口、查明占用者、给出推荐端口
+       （image-clip 这类 monorepo 后端起不来的典型现场） */
+const CRASH_PORT = 7799;
+const crashAppDir = path.join(os.tmpdir(), 'sm-eaddr-app');
+await fs.promises.mkdir(crashAppDir, { recursive: true });
+await fs.promises.writeFile(
+  path.join(crashAppDir, 'package.json'),
+  JSON.stringify({ name: 'sm-eaddr-app', version: '1.0.0', private: true, type: 'module', scripts: { start: 'node index.js' } }, null, 2),
+  'utf8',
+);
+await fs.promises.writeFile(
+  path.join(crashAppDir, 'index.js'),
+  [
+    "import http from 'node:http';",
+    `const PORT = Number(process.env.PORT ?? ${CRASH_PORT});`,
+    "const server = http.createServer((q, s) => s.end('ok'));",
+    "server.listen(PORT, '127.0.0.1', () => console.log('listening', PORT));",
+    '',
+  ].join('\n'),
+  'utf8',
+);
+
+const crashSquat = net.createServer(() => {});
+await new Promise((resolve, reject) => {
+  crashSquat.once('error', reject);
+  crashSquat.listen(CRASH_PORT, '127.0.0.1', resolve);
+});
+const crashSvc = await api('/api/services', {
+  method: 'POST',
+  body: { packageJsonPath: path.join(crashAppDir, 'package.json'), port: CRASH_PORT, name: 'sm-eaddr-app' },
+});
+const crashId = crashSvc.json?.service?.id;
+if (crashId) {
+  await api(`/api/services/${crashId}/start`, { method: 'POST', body: {} });
+  await sleep(3500);
+  const crashed = (await api(`/api/services/${crashId}`)).json?.service;
+  check('端口被占时启动失败被判定为 crashed', crashed?.state?.status === 'crashed', `status=${crashed?.state?.status}`);
+  check('崩溃后从日志认出被占用的端口', crashed?.state?.crashPort === CRASH_PORT, `crashPort=${crashed?.state?.crashPort}`);
+  check('lastError 直接说明端口被占用', /端口 7799 已被占用/.test(crashed?.state?.lastError || ''), crashed?.state?.lastError);
+  check('崩溃诊断给出占用者 PID', crashed?.portConflictHint?.occupants?.[0]?.pid === process.pid,
+    `occupant=${JSON.stringify(crashed?.portConflictHint?.occupants?.[0] || null)}`);
+  check('崩溃诊断给出随机可用端口', Number.isInteger(crashed?.portConflictHint?.suggestion),
+    `suggestion=${crashed?.portConflictHint?.suggestion}`);
+  const pfAfterCrash = (await api(`/api/services/${crashId}/preflight`)).json;
+  check('二次启动前预检能提前拦住（复用崩溃端口）',
+    pfAfterCrash?.checked === true && pfAfterCrash?.port === CRASH_PORT && pfAfterCrash?.occupied === true,
+    `checked=${pfAfterCrash?.checked} port=${pfAfterCrash?.port} occupied=${pfAfterCrash?.occupied}`);
+  const hintPort = crashed?.portConflictHint?.suggestion;
+  if (hintPort) {
+    await api(`/api/services/${crashId}/start`, { method: 'POST', body: { port: hintPort } });
+    await sleep(3000);
+    const recovered = (await api(`/api/services/${crashId}`)).json?.service;
+    check('按推荐端口换端口后恢复正常', recovered?.state?.status === 'running' && !recovered?.portConflictHint,
+      `status=${recovered?.state?.status} port=${recovered?.state?.effectivePort}`);
+    await api(`/api/services/${crashId}/stop`, { method: 'POST', body: { force: true } });
+  }
+  await api(`/api/services/${crashId}?force=true`, { method: 'DELETE' });
+}
+await new Promise((resolve) => crashSquat.close(resolve));
+await fs.promises.rm(crashAppDir, { recursive: true, force: true }).catch(() => {});
 await sleep(600);
 
 /* 10. 目录定位能力 */
