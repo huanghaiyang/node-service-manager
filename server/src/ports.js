@@ -383,10 +383,23 @@ function parseLsof(text) {
   return map;
 }
 
-/** 从 package.json 的 scripts 里猜出可能的端口（仅用于展示提示，不参与判定） */
+/**
+ * 由监听端口推导浏览器可打开的入口地址。
+ *
+ * 绑定地址不能直接塞进 URL：
+ *   - `0.0.0.0` / `::` / `*` 是通配地址，浏览器打不开，要换成回环
+ *   - `::1` 换成 `127.0.0.1` 更稳（部分环境的 IPv6 回环不通）
+ *   - 只绑定了某个具体网卡地址时，必须用它 —— 换成 127.0.0.1 反而连不上
+ */
 export function defaultEntryUrl(port, host = '127.0.0.1') {
   if (!port) return '';
-  return `http://${host}:${port}/`;
+  const raw = String(host || '').trim();
+  const wildcard = !raw || raw === '0.0.0.0' || raw === '::' || raw === '[::]' || raw === '*';
+  const loopback = raw === '::1' || raw === '[::1]';
+  const target = wildcard || loopback ? '127.0.0.1' : raw;
+  // IPv6 字面量需要方括号
+  const printable = target.includes(':') && !target.startsWith('[') ? `[${target}]` : target;
+  return `http://${printable}:${port}/`;
 }
 
 export { parseLocalAddress };

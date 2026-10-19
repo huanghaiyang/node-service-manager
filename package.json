@@ -14,7 +14,10 @@
     "build": "node scripts/build-web.mjs",
     "build:watch": "node scripts/build-web.mjs --watch",
     "serve": "npm run build && node server/src/index.js",
-    "test:smoke": "node scripts/smoke-test.mjs"
+    "test": "node scripts/unit-test.mjs",
+    "test:unit": "node scripts/unit-test.mjs",
+    "test:smoke": "node scripts/smoke-test.mjs",
+    "test:all": "node scripts/unit-test.mjs && node scripts/smoke-test.mjs"
   },
   "dependencies": {
     "express": "^4.21.2",

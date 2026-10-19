@@ -530,6 +530,73 @@ const restoreRes = await api('/api/services/restore', { method: 'POST', body: {}
 check('「恢复上次运行的服务」接口可用', restoreRes.ok && Array.isArray(restoreRes.json?.results),
   `results=${JSON.stringify(restoreRes.json?.results)}`);
 
+/* 9j. 批量启动的端口预检：注定会冲突的服务必须在启动**之前**被拦下 */
+{
+  // 批次内撞端口：两个服务声明同一个端口
+  const dupA = await api('/api/services', {
+    method: 'POST',
+    body: { packageJsonPath: PKG, port: 7100, name: 'batch-dup-a', allowDuplicate: true },
+  });
+  const dupB = await api('/api/services', {
+    method: 'POST',
+    body: { packageJsonPath: PKG, port: 7100, name: 'batch-dup-b', allowDuplicate: true },
+  });
+  const idA = dupA.json?.service?.id;
+  const idB = dupB.json?.service?.id;
+
+  const batch1 = (await api('/api/services/start-all', { method: 'POST', body: {} })).json;
+  const dupConflict = (batch1?.conflicts || []).find((c) => c.reason === 'duplicate-in-batch');
+  check('批量启动能识别「批次内端口重复」', Boolean(dupConflict),
+    JSON.stringify((batch1?.conflicts || []).map((c) => `${c.reason}:${c.port}`)));
+  check('冲突的服务被拦下而不是先崩一次',
+    (batch1?.blocked ?? 0) === 2
+    && ![idA, idB].some((id) => (batch1?.results || []).find((r) => r.id === id)?.ok === true),
+    `blocked=${batch1?.blocked} 冲突服务=${JSON.stringify((batch1?.results || [])
+      .filter((r) => [idA, idB].includes(r.id)).map((r) => ({ name: r.name, ok: r.ok, blocked: r.blocked })))}`);
+  check('冲突清单里列出了全部相关服务', (dupConflict?.services?.length || 0) === 2,
+    (dupConflict?.services || []).map((s) => s.name).join(', '));
+  const afterDup = (await api('/api/services')).json.services;
+  check('被拦下的服务状态仍是 stopped',
+    [idA, idB].every((id) => afterDup.find((s) => s.id === id)?.state?.status === 'stopped'));
+
+  // 只留一个 → 同一端口不再重复，应能正常启动
+  await api(`/api/services/${idB}?force=true`, { method: 'DELETE' });
+  const batch2 = (await api('/api/services/start-all', { method: 'POST', body: {} })).json;
+  check('移除重复项后可正常批量启动', (batch2?.started ?? 0) === 1 && (batch2?.conflicts || []).length === 0,
+    `started=${batch2?.started} conflicts=${(batch2?.conflicts || []).length}`);
+  await sleep(2500);
+  check('被启动的服务确实在运行',
+    (await api(`/api/services/${idA}`)).json?.service?.state?.status === 'running');
+  await api(`/api/services/${idA}/stop`, { method: 'POST', body: { force: true } });
+  await sleep(600);
+  await api(`/api/services/${idA}?force=true`, { method: 'DELETE' });
+  await sleep(400);
+
+  // 端口被外部进程占用：应在启动前拦下并带出占用者
+  const OCC_PORT = 7106;
+  const occ = net.createServer(() => {});
+  await new Promise((resolve, reject) => {
+    occ.once('error', reject);
+    occ.listen(OCC_PORT, '127.0.0.1', resolve);
+  });
+  const occSvc = await api('/api/services', {
+    method: 'POST',
+    body: { packageJsonPath: PKG, port: OCC_PORT, name: 'batch-occupied', allowDuplicate: true },
+  });
+  const occId = occSvc.json?.service?.id;
+  const batch3 = (await api('/api/services/start-all', { method: 'POST', body: {} })).json;
+  const occConflict = (batch3?.conflicts || []).find((c) => c.reason === 'occupied');
+  check('批量启动能识别「端口已被占用」', Boolean(occConflict), `port=${occConflict?.port}`);
+  check('占用冲突带出了占用者 PID', occConflict?.occupants?.[0]?.pid === process.pid,
+    JSON.stringify(occConflict?.occupants?.[0] || null));
+  check('被占用端口上的服务被拦下',
+    (batch3?.results || []).some((r) => r.id === occId && r.blocked === true),
+    JSON.stringify((batch3?.results || []).filter((r) => r.blocked).map((r) => r.name)));
+  await new Promise((resolve) => occ.close(resolve));
+  await api(`/api/services/${occId}?force=true`, { method: 'DELETE' });
+  await sleep(400);
+}
+
 /* 清理：保留托管记录以便前端演示，这里只删除本次测试产生的服务 */
 await api(`/api/services/${id}?force=true`, { method: 'DELETE' });
 check('移除托管记录', (await api('/api/services')).json?.services?.length === 0, '清理完成');

@@ -25,6 +25,8 @@ export const state = reactive({
   },
   /** 端口冲突弹窗上下文；非空即表示弹窗打开 */
   portConflict: null,
+  /** 批量启动时被端口冲突拦下的清单；非空即表示要展示冲突汇总 */
+  batchConflicts: [],
 });
 
 let closeStream = null;
@@ -246,6 +248,37 @@ export function openPortConflictForHint(svc) {
   };
 }
 
+/**
+ * 批量启动：后端会先算端口冲突，把「注定会崩」的服务拦下来并返回冲突清单。
+ * 这里负责把结果讲清楚 —— 尤其是别让用户以为「全部启动成功了」。
+ */
+export async function startAllServices() {
+  try {
+    const res = await api.startAll();
+    const conflicts = res?.conflicts || [];
+    const started = res?.started ?? (res?.results || []).filter((r) => r.ok).length;
+    const failed = res?.failed ?? 0;
+    if (conflicts.length) {
+      state.batchConflicts = conflicts;
+      toast(
+        `已启动 ${started} 个；${conflicts.length} 个因端口冲突被拦下${failed ? `；${failed} 个启动失败` : ''}`,
+        'err',
+        8000,
+      );
+    } else if (started) {
+      toast(`已批量启动 ${started} 个服务${failed ? `（${failed} 个失败）` : ''}`, failed ? 'err' : 'ok');
+    } else {
+      toast('没有需要启动的服务', 'ok');
+    }
+    return res;
+  } catch (err) {
+    toast(err.message || String(err), 'err', 7000);
+    return null;
+  } finally {
+    refresh();
+  }
+}
+
 export const actions = {
   start: (svc) => startService(svc),
   stop: (svc) => run(() => api.stop(svc.id), { okMessage: `已停止 ${svc.name}` }),
@@ -258,6 +291,6 @@ export const actions = {
   ),
   scanExternal: () => run(() => api.scanExternal(), { okMessage: '已扫描外部运行的进程' }),
   remove: (svc) => run(() => { forgetLogs(svc.id); return api.remove(svc.id, true); }, { okMessage: `已移除 ${svc.name}` }),
-  startAll: () => run(() => api.startAll(), { okMessage: '已批量启动' }),
+  startAll: () => startAllServices(),
   stopAll: () => run(() => api.stopAll(), { okMessage: '已批量停止' }),
 };

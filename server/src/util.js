@@ -102,8 +102,36 @@ export function sanitizeLogLine(text) {
   return s;
 }
 
-/** 进程是否存活（信号 0 探测） */
-export function isAlive(pid) {
+/**
+ * 清理 captureStdout 留下的临时文件。
+ *
+ * 正常路径每次调用都会删掉自己的文件，但进程被强杀/崩溃时会残留（实测能攒下几个）。
+ * 这里在启动时扫一遍 data/tmp。
+ *
+ * 默认只删「10 分钟以上没动过」的，避免误删另一个仍在跑的实例的在途文件；
+ * 想清得更激进可以调小 minAgeMs（测试里传 0）。
+ */
+export function cleanupTmpDir({ minAgeMs = 10 * 60 * 1000 } = {}) {
+  let removed = 0;
+  try {
+    if (!fs.existsSync(TMP_DIR)) return 0;
+    const now = Date.now();
+    for (const name of fs.readdirSync(TMP_DIR)) {
+      if (!name.startsWith('cap-')) continue;
+      const abs = path.join(TMP_DIR, name);
+      try {
+        const st = fs.statSync(abs);
+        if (!st.isFile()) continue;
+        if (minAgeMs > 0 && now - st.mtimeMs < minAgeMs) continue;
+        fs.rmSync(abs, { force: true });
+        removed += 1;
+      } catch { /* 单个文件失败不影响其它 */ }
+    }
+  } catch { /* 目录不可读就当无事发生 */ }
+  return removed;
+}
+
+/** 进程是否存活（信号 0 探测） */export function isAlive(pid) {
   if (!pid || !Number.isInteger(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);

@@ -5,12 +5,12 @@ import ServiceDetail from './components/ServiceDetail.vue';
 import AddServiceModal from './components/AddServiceModal.vue';
 import ProcessPanel from './components/ProcessPanel.vue';
 import PortConflictModal from './components/PortConflictModal.vue';
+import BatchConflictModal from './components/BatchConflictModal.vue';
 import SettingsModal from './components/SettingsModal.vue';
 import {
   state, runningCount, totals, connect, disconnect, refresh, actions, toast,
   initProcessPanel, persistProcessPanel, loadNodeProcesses,
-} from './store.js';
-import { api } from './api.js';
+} from './store.js';import { api } from './api.js';
 import { formatBytes, formatPercent } from './format.js';
 
 const showAdd = ref(false);
@@ -62,6 +62,26 @@ async function refreshAll() {
     await refresh();
     toast(scan?.changed ? `已刷新（发现 ${scan.changed} 个外部运行的服务）` : '已刷新', 'ok');
   });
+}
+
+/**
+ * 从「批量启动冲突」里挑一个服务就地换端口：
+ * 复用单服务的冲突弹窗，用户选好端口后直接启动它。
+ */
+function openPortConflictFromBatch({ serviceId, conflict }) {
+  const svc = state.services.find((s) => s.id === serviceId);
+  if (!svc) return;
+  state.portConflict = {
+    service: svc,
+    info: {
+      checked: true,
+      occupied: true,
+      port: conflict.port,
+      occupants: conflict.occupants || [],
+      suggestion: conflict.suggestion || null,
+    },
+  };
+  state.batchConflicts = [];
 }
 
 function openDetail(svc) {
@@ -219,6 +239,12 @@ async function afterCreated(svc) {
       v-if="state.portConflict"
       :context="state.portConflict"
       @close="state.portConflict = null"
+    />
+
+    <BatchConflictModal
+      v-if="state.batchConflicts?.length"
+      @close="state.batchConflicts = []"
+      @fix="openPortConflictFromBatch"
     />
 
     <div class="toast-host">

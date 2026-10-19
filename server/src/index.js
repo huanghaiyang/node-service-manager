@@ -9,19 +9,25 @@ import { ServiceStore } from './store.js';
 import { LogStore } from './logs.js';
 import { ProcessManager, STATUS, buildLaunchPlan } from './pm.js';
 import { ProcessSampler } from './metrics.js';
-import { PortScanner } from './ports.js';
+import { PortScanner, defaultEntryUrl } from './ports.js';
+import { depthOf, candidateRank, corroboratesLaunch, topmostWrapper, cmdLabel } from './external.js';
 import { getAutostartStatus, setAutostart } from './autostart.js';
 import { readSettings, patchSettings } from './settings.js';
 import {
   analyzePackage, listDirectory, listDriveRoots, scanForPackages, PackageJsonError,
 } from './packageScanner.js';
-import { displayName, formatBytes } from './util.js';
+import { displayName, formatBytes, sleep, cleanupTmpDir } from './util.js';
 
 const DIST_DIR = path.resolve(fileURLToPath(new URL('../../dist', import.meta.url)));
 
 /* ------------------------------- 基础设施 --------------------------------- */
 
 ensureDirs();
+// 清掉上次异常退出（被强杀/崩溃）留下的临时捕获文件
+{
+  const cleanedTmp = cleanupTmpDir();
+  if (cleanedTmp) console.log(`  ▸ 已清理 ${cleanedTmp} 个临时文件（data/tmp）`);
+}
 
 const app = express();
 app.disable('x-powered-by');
@@ -134,8 +140,16 @@ function resolveEntry(svc, { ports = [] } = {}) {
   const tcp = ports.filter((p) => p.proto === 'tcp');
   const preferred = svc.port ? tcp.find((p) => p.port === svc.port) : null;
   const primary = preferred || tcp[0];
-  if (primary) return { url: `http://127.0.0.1:${primary.port}/`, source: 'detected', port: primary.port };
-  if (svc.port) return { url: `http://127.0.0.1:${svc.port}/`, source: 'declared', port: svc.port };
+  // 用实际绑定地址推导：既避免把 0.0.0.0 写进链接，也不会在只绑了 LAN IP 时误用回环
+  if (primary) {
+    return {
+      url: defaultEntryUrl(primary.port, primary.address),
+      source: 'detected',
+      port: primary.port,
+      address: primary.address,
+    };
+  }
+  if (svc.port) return { url: defaultEntryUrl(svc.port), source: 'declared', port: svc.port };
   return { url: '', source: 'none' };
 }
 
@@ -333,108 +347,6 @@ async function buildNodeProcessList({ details = null, force = false } = {}) {
 /* --------------------------- 外部运行探测器 ------------------------------- */
 
 let lastExternalScanAt = 0;
-
-/** 路径归一化：统一分隔符、去尾斜杠、小写（Windows 大小写不敏感） */
-function normPath(p) {
-  return String(p || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
-}
-
-/** 从 ppid 链推算深度（越浅越可能是进程树根） */
-function depthOf(pid, ppidOf) {
-  let depth = 0;
-  let cur = pid;
-  for (let i = 0; i < 32; i += 1) {
-    const parent = ppidOf.get(cur);
-    if (!parent || parent <= 0 || parent === cur) break;
-    depth += 1;
-    cur = parent;
-  }
-  return depth;
-}
-
-/** 候选优劣：先看信号强度，再看是不是树根（越浅越好） */
-function candidateRank(c) {
-  const conf = c.confidence === 'high' ? 0 : 1;
-  return conf * 1000 + Math.min(c.depth || 0, 99);
-}
-
-/** 收集某 pid 的整棵子树（含自身） */
-function subtreeOf(pid, ppidOf) {
-  const childrenOf = new Map();
-  for (const [child, parent] of ppidOf) {
-    if (!childrenOf.has(parent)) childrenOf.set(parent, []);
-    childrenOf.get(parent).push(child);
-  }
-  const out = new Set();
-  const stack = [pid];
-  while (stack.length) {
-    const cur = stack.pop();
-    if (out.has(cur)) continue;
-    out.add(cur);
-    for (const c of childrenOf.get(cur) || []) stack.push(c);
-  }
-  return out;
-}
-
-/**
- * 校验「这棵进程树确实是从该项目启动的」，而不是仅仅命令里出现了这个路径。
- *
- * 这条校验是被真实误判逼出来的：`node D:\sgames\gaea-rea\gaea-mcp\server.mjs`
- * 是一个 MCP 服务器进程，命令行确实包含项目目录，但它跟被托管的 web 服务毫无关系。
- * 只看「路径包含」会把任何引用该目录的 node 进程都认成服务在跑。
- *
- * 能佐证的信号：
- *   a) 树里有进程引用 <root>/node_modules/ —— npm/pnpm 拉起项目脚本时的典型形态
- *   b) 树里有进程引用服务的 package.json
- *   c) 服务声明了端口，且树里有进程在监听它
- */
-function corroboratesLaunch({ pid, ppidOf, cmdOf, portsOfPid, roots, packageJsonPath, declaredPort }) {
-  const tree = subtreeOf(pid, ppidOf);
-  const needles = [...roots, packageJsonPath].filter(Boolean).map(normPath);
-  for (const cur of tree) {
-    const cmd = normPath(cmdOf.get(cur));
-    if (cmd) {
-      for (const needle of needles) {
-        if (needle && cmd.includes(`${needle}/node_modules/`)) return 'node_modules';
-        if (needle && cmd.includes(needle) && needle.endsWith('package.json')) return 'package.json';
-      }
-    }
-    if (declaredPort) {
-      const ports = portsOfPid(cur) || [];
-      if (ports.some((p) => p.port === declaredPort)) return 'port';
-    }
-  }
-  return null;
-}
-
-/** 包管理器包装进程（npm / pnpm / yarn / npx）—— 接管时优先选最顶层的它 */
-function isPmWrapper(cmd) {
-  if (!cmd) return false;
-  return /\b(npm-cli\.js|npx-cli\.js|pnpm\.c?js|yarn\.js|yarn\.cjs)\b/i.test(cmd);
-}
-
-/** 从候选 pid 向上找到最顶层的包管理器包装进程，作为接管目标 */
-function topmostWrapper(pid, ppidOf, cmdOf) {
-  let best = pid;
-  let cur = pid;
-  for (let i = 0; i < 16; i += 1) {
-    const parent = ppidOf.get(cur);
-    if (!parent || parent <= 0 || !cmdOf.has(parent)) break;
-    if (!isPmWrapper(cmdOf.get(parent))) break;
-    best = parent;
-    cur = parent;
-  }
-  return best;
-}
-
-/** 从命令行里取一个便于辨认的短标签，例如 gaea-mcp/server.mjs */
-function cmdLabel(commandLine) {
-  if (!commandLine) return '';
-  const tokens = String(commandLine).trim().split(/\s+/);
-  const target = tokens.length > 1 ? tokens[tokens.length - 1] : tokens[0];
-  const parts = target.replace(/["']/g, '').split(/[\\/]/).filter(Boolean);
-  return parts.length <= 2 ? parts.join('/') : parts.slice(-2).join('/');
-}
 
 /**
  * 探测「服务被外部启动」：用户绕过本工具，自己在终端里 `npm run dev`。
@@ -1100,22 +1012,120 @@ app.post('/api/scan', wrap(async (req, res) => {
 
 /* ---- 批量操作 ---- */
 
+/**
+ * 批量启动前的端口规划。
+ *
+ * 单服务启动时端口预检在前端做，但「全部启动」是盲启动：两个服务声明同一端口时
+ * 必然有一个崩，而用户只会看到「有一个服务起不来」。这里在启动**之前**统一算一次：
+ *
+ *  1. 批次内部撞端口（多个服务声明同一端口）→ 全部拦下。
+ *     因为无论先起谁，后起的那个都会 EADDRINUSE，只起一半反而更让人困惑。
+ *  2. 端口已被外部/其它服务占用 → 拦下该服务并带上占用者信息。
+ *
+ * 返回要拦下的服务 id 集合与可直接展示的冲突清单。
+ */
+async function planBatchStart(candidates) {
+  const byPort = new Map();
+  for (const { svc, st } of candidates) {
+    const detected = (lastMetrics.get(svc.id)?.ports || []).find((p) => p.proto === 'tcp');
+    const port = svc.port || st.crashPort || detected?.port || null;
+    if (!port) continue;
+    if (!byPort.has(port)) byPort.set(port, []);
+    byPort.get(port).push(svc);
+  }
+
+  const conflicts = [];
+  const blocked = new Set();
+
+  for (const [port, svcs] of byPort) {
+    if (svcs.length > 1) {
+      conflicts.push({
+        port,
+        reason: 'duplicate-in-batch',
+        services: svcs.map((s) => ({ id: s.id, name: s.name })),
+        occupants: [],
+        suggestion: null,
+        detail: `批次内有 ${svcs.length} 个服务都声明了端口 ${port}，同时启动必然相互冲突`,
+      });
+      for (const s of svcs) blocked.add(s.id);
+      continue;
+    }
+    const svc = svcs[0];
+    const info = await buildPortConflictInfo(port).catch(() => null);
+    if (info?.occupied) {
+      conflicts.push({
+        port,
+        reason: 'occupied',
+        services: [{ id: svc.id, name: svc.name }],
+        occupants: info.occupants,
+        suggestion: info.suggestion,
+        detail: describePortOccupant(info),
+      });
+      blocked.add(svc.id);
+    }
+  }
+  return { conflicts, blocked };
+}
+
 app.post('/api/services/start-all', wrap(async (req, res) => {
+  const body = req.body || {};
+  const staggerMs = Number.isFinite(Number(body.staggerMs)) ? Math.max(0, Number(body.staggerMs)) : 0;
+
   const results = [];
+  const candidates = [];
   for (const svc of store.list()) {
+    const st = pm.stateOf(svc.id);
+    if (st.status === STATUS.RUNNING || st.status === STATUS.STARTING) {
+      results.push({ id: svc.id, name: svc.name, skipped: true, reason: '已在运行' });
+      continue;
+    }
+    if (st.pid) {
+      // 有 pid 但没在跑 = 外部运行中 / 已接管等，交给用户决定，不重复拉起
+      results.push({ id: svc.id, name: svc.name, skipped: true, reason: `当前状态为 ${st.status}，请先处理` });
+      continue;
+    }
+    candidates.push({ svc, st });
+  }
+
+  const { conflicts, blocked } = candidates.length
+    ? await planBatchStart(candidates)
+    : { conflicts: [], blocked: new Set() };
+
+  let started = 0;
+  for (const { svc } of candidates) {
+    if (blocked.has(svc.id)) {
+      const conflict = conflicts.find((c) => c.services.some((s) => s.id === svc.id));
+      results.push({
+        id: svc.id,
+        name: svc.name,
+        ok: false,
+        blocked: true,
+        port: conflict?.port ?? null,
+        error: conflict ? `端口冲突：${conflict.detail}` : '端口冲突',
+      });
+      continue;
+    }
     try {
-      const st = pm.stateOf(svc.id);
-      if (st.status === STATUS.RUNNING || st.status === STATUS.STARTING) {
-        results.push({ id: svc.id, name: svc.name, skipped: true, reason: '已在运行' });
-        continue;
-      }
       await pm.start(svc.id);
+      started += 1;
       results.push({ id: svc.id, name: svc.name, ok: true });
     } catch (err) {
       results.push({ id: svc.id, name: svc.name, ok: false, error: err.message });
     }
+    if (staggerMs) await sleep(staggerMs);
   }
-  res.json({ ok: true, results });
+
+  if (started) scheduleQuickSample(600);
+  broadcast('services-changed', { action: 'start-all' });
+  res.json({
+    ok: true,
+    results,
+    conflicts,
+    started,
+    skipped: results.filter((r) => r.skipped).length,
+    blocked: results.filter((r) => r.blocked).length,
+    failed: results.filter((r) => r.ok === false && !r.blocked).length,
+  });
 }));
 
 app.post('/api/services/stop-all', wrap(async (req, res) => {
