@@ -436,6 +436,69 @@ if (extId) {
 await fs.promises.rm(extAppDir, { recursive: true, force: true }).catch(() => {});
 await sleep(400);
 
+/* 9h. 误判回归：只是"碰了"项目目录的进程 ≠ 服务在跑
+       真实案例：node D:\sgames\gaea-rea\gaea-mcp\server.mjs 是个 MCP 服务器，
+       命令行含项目目录，但和被托管的 web 服务毫无关系，却被断言成「外部运行中」。 */
+const fpDir = path.join(os.tmpdir(), 'sm-fp-proj');
+await fs.promises.mkdir(path.join(fpDir, 'tools'), { recursive: true });
+await fs.promises.mkdir(path.join(fpDir, 'node_modules', 'fake-cli'), { recursive: true });
+await fs.promises.writeFile(
+  path.join(fpDir, 'package.json'),
+  JSON.stringify({ name: 'sm-fp-proj', version: '1.0.0', private: true, type: 'module', scripts: { dev: 'node app.js' } }, null, 2),
+  'utf8',
+);
+await fs.promises.writeFile(path.join(fpDir, 'app.js'), 'setInterval(() => {}, 1000);\n', 'utf8');
+await fs.promises.writeFile(path.join(fpDir, 'tools', 'helper.mjs'), 'setInterval(() => {}, 1000);\n', 'utf8');
+await fs.promises.writeFile(path.join(fpDir, 'node_modules', 'fake-cli', 'cli.js'), 'setInterval(() => {}, 1000);\n', 'utf8');
+
+const { spawn: spawnChild } = await import('node:child_process');
+const spawnQuiet = (args) => spawnChild(process.execPath, args, { stdio: 'ignore' });
+
+const fpSvc = await api('/api/services', {
+  method: 'POST',
+  body: { packageJsonPath: path.join(fpDir, 'package.json'), name: 'sm-fp-proj' },
+});
+const fpId = fpSvc.json?.service?.id;
+if (fpId) {
+  // 只"碰了"项目目录、但不是该服务的启动命令
+  const helper = spawnQuiet([path.join(fpDir, 'tools', 'helper.mjs')]);
+  await sleep(6000);
+  const fpState = (await api(`/api/services/${fpId}`)).json?.service;
+  const fpDetailOk = Boolean((await api('/api/processes/node?refresh=1')).json?.detailAvailable);
+  check('命令行只"碰了"项目目录的进程不会被断言成外部运行中',
+    fpState?.state?.status !== 'orphaned',
+    `status=${fpState?.state?.status} pid=${fpState?.state?.pid}`);
+  if (fpDetailOk) {
+    check('降级为「可疑」提示并说明不像启动命令',
+      fpState?.state?.externalHint?.pid === helper.pid
+      && /不像该服务的启动命令/.test(fpState?.state?.externalHint?.detail || ''),
+      JSON.stringify(fpState?.state?.externalHint || null));
+  } else {
+    console.log('  （当前环境读不到命令行，弱信号提示不适用）');
+  }
+
+  // 真正的"由项目脚本启动"：命令行含 <root>/node_modules/
+  const runner = spawnQuiet([path.join(fpDir, 'node_modules', 'fake-cli', 'cli.js')]);
+  await sleep(6000);
+  const fpState2 = (await api(`/api/services/${fpId}`)).json?.service;
+  if (fpDetailOk) {
+    check('可佐证的外部启动仍被判为外部运行中', fpState2?.state?.status === 'orphaned',
+      `status=${fpState2?.state?.status} pid=${fpState2?.state?.pid}`);
+    check('佐证依据写明 node_modules', /node_modules/.test(fpState2?.state?.external?.detail || ''),
+      fpState2?.state?.external?.detail);
+  } else {
+    check('（无命令行时）依然不会误判', fpState2?.state?.status !== 'orphaned',
+      `status=${fpState2?.state?.status}`);
+  }
+
+  try { helper.kill('SIGKILL'); } catch { /* ignore */ }
+  try { runner.kill('SIGKILL'); } catch { /* ignore */ }
+  await sleep(500);
+  await api(`/api/services/${fpId}?force=true`, { method: 'DELETE' });
+}
+await fs.promises.rm(fpDir, { recursive: true, force: true }).catch(() => {});
+await sleep(400);
+
 /* 清理：保留托管记录以便前端演示，这里只删除本次测试产生的服务 */
 await api(`/api/services/${id}?force=true`, { method: 'DELETE' });
 check('移除托管记录', (await api('/api/services')).json?.services?.length === 0, '清理完成');

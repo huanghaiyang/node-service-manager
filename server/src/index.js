@@ -332,6 +332,11 @@ async function buildNodeProcessList({ details = null, force = false } = {}) {
 
 let lastExternalScanAt = 0;
 
+/** 路径归一化：统一分隔符、去尾斜杠、小写（Windows 大小写不敏感） */
+function normPath(p) {
+  return String(p || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+}
+
 /** 从 ppid 链推算深度（越浅越可能是进程树根） */
 function depthOf(pid, ppidOf) {
   let depth = 0;
@@ -351,6 +356,84 @@ function candidateRank(c) {
   return conf * 1000 + Math.min(c.depth || 0, 99);
 }
 
+/** 收集某 pid 的整棵子树（含自身） */
+function subtreeOf(pid, ppidOf) {
+  const childrenOf = new Map();
+  for (const [child, parent] of ppidOf) {
+    if (!childrenOf.has(parent)) childrenOf.set(parent, []);
+    childrenOf.get(parent).push(child);
+  }
+  const out = new Set();
+  const stack = [pid];
+  while (stack.length) {
+    const cur = stack.pop();
+    if (out.has(cur)) continue;
+    out.add(cur);
+    for (const c of childrenOf.get(cur) || []) stack.push(c);
+  }
+  return out;
+}
+
+/**
+ * 校验「这棵进程树确实是从该项目启动的」，而不是仅仅命令里出现了这个路径。
+ *
+ * 这条校验是被真实误判逼出来的：`node D:\sgames\gaea-rea\gaea-mcp\server.mjs`
+ * 是一个 MCP 服务器进程，命令行确实包含项目目录，但它跟被托管的 web 服务毫无关系。
+ * 只看「路径包含」会把任何引用该目录的 node 进程都认成服务在跑。
+ *
+ * 能佐证的信号：
+ *   a) 树里有进程引用 <root>/node_modules/ —— npm/pnpm 拉起项目脚本时的典型形态
+ *   b) 树里有进程引用服务的 package.json
+ *   c) 服务声明了端口，且树里有进程在监听它
+ */
+function corroboratesLaunch({ pid, ppidOf, cmdOf, portsOfPid, roots, packageJsonPath, declaredPort }) {
+  const tree = subtreeOf(pid, ppidOf);
+  const needles = [...roots, packageJsonPath].filter(Boolean).map(normPath);
+  for (const cur of tree) {
+    const cmd = normPath(cmdOf.get(cur));
+    if (cmd) {
+      for (const needle of needles) {
+        if (needle && cmd.includes(`${needle}/node_modules/`)) return 'node_modules';
+        if (needle && cmd.includes(needle) && needle.endsWith('package.json')) return 'package.json';
+      }
+    }
+    if (declaredPort) {
+      const ports = portsOfPid(cur) || [];
+      if (ports.some((p) => p.port === declaredPort)) return 'port';
+    }
+  }
+  return null;
+}
+
+/** 包管理器包装进程（npm / pnpm / yarn / npx）—— 接管时优先选最顶层的它 */
+function isPmWrapper(cmd) {
+  if (!cmd) return false;
+  return /\b(npm-cli\.js|npx-cli\.js|pnpm\.c?js|yarn\.js|yarn\.cjs)\b/i.test(cmd);
+}
+
+/** 从候选 pid 向上找到最顶层的包管理器包装进程，作为接管目标 */
+function topmostWrapper(pid, ppidOf, cmdOf) {
+  let best = pid;
+  let cur = pid;
+  for (let i = 0; i < 16; i += 1) {
+    const parent = ppidOf.get(cur);
+    if (!parent || parent <= 0 || !cmdOf.has(parent)) break;
+    if (!isPmWrapper(cmdOf.get(parent))) break;
+    best = parent;
+    cur = parent;
+  }
+  return best;
+}
+
+/** 从命令行里取一个便于辨认的短标签，例如 gaea-mcp/server.mjs */
+function cmdLabel(commandLine) {
+  if (!commandLine) return '';
+  const tokens = String(commandLine).trim().split(/\s+/);
+  const target = tokens.length > 1 ? tokens[tokens.length - 1] : tokens[0];
+  const parts = target.replace(/["']/g, '').split(/[\\/]/).filter(Boolean);
+  return parts.length <= 2 ? parts.join('/') : parts.slice(-2).join('/');
+}
+
 /**
  * 探测「服务被外部启动」：用户绕过本工具，自己在终端里 `npm run dev`。
  *
@@ -358,68 +441,54 @@ function candidateRank(c) {
  * 会导致界面显示「已停止」而机器上其实在跑 —— 最容易踩的坑。
  *
  * 归属用两个信号，强信号优先：
- *   1. 命令行包含该服务的工作目录（WMI / ps 能拿到命令行时）—— 高置信
- *   2. 该服务声明的端口上，有不属于任何托管树的 node 进程在监听 —— 中置信
- * 多个服务声明同一端口时不归属（避免误判）。
+ *   1. 命令行引用了该服务，**且能佐证是从该项目启动的**（见 corroboratesLaunch）
+ *      —— 高置信，断言「外部运行中」
+ *   2. 该服务声明的端口上，有不属于任何托管树的 node 进程在监听 —— 弱信号，只提示
  *
- * 只对当前「没在跑」的服务做探测，避免和正常托管流程抢状态。
+ * 为什么强信号也要求佐证：「命令行里出现项目目录」太宽松了。
+ * 真实误判案例：`node D:\sgames\gaea-rea\gaea-mcp\server.mjs` 是一个 MCP 服务器，
+ * 命令行确实包含项目目录，但它和该项目的 web 服务毫无关系，却被断言成「外部运行中」。
+ *
+ * 同时本函数还负责**复核已有的外部声明**：外部进程可能已经变了性质或被 PID 复用，
+ * 只要不再能佐证，就撤销这个声明（回落到「已停止」）。
  */
 async function detectExternalRuns({ force = false } = {}) {
   if (!force && Date.now() - lastExternalScanAt < 2500) return 0;
   lastExternalScanAt = Date.now();
 
-  const targets = store.list().filter((svc) => {
+  const all = store.list();
+  // 需要探测（没在跑）的服务；以及需要复核（已被判为外部运行但未接管）的服务
+  const targets = [];
+  const toVerify = [];
+  for (const svc of all) {
     const st = pm.stateOf(svc.id);
-    return !st.pid && ![STATUS.STARTING, STATUS.STOPPING, STATUS.RUNNING, STATUS.ORPHANED].includes(st.status);
-  });
-  if (!targets.length) return 0;
+    if (st.status === STATUS.ORPHANED && !st.adopted) toVerify.push({ svc, st });
+    if (!st.pid && ![STATUS.STARTING, STATUS.STOPPING, STATUS.RUNNING, STATUS.ORPHANED].includes(st.status)) {
+      targets.push(svc);
+    }
+  }
+  if (!targets.length && !toVerify.length) return 0;
 
   const listing = await sampler.listNodeProcesses({ ttlMs: 2500 });
-  // 排掉本进程，以及已经落在某个托管服务进程树里的进程
+  // 注意：ppid / 命令行映射用**全量** node 进程构建 ——
+  // 复核已有声明时要能看到「该服务自己的进程树」，它会被下面的 free 过滤掉。
+  const ppidOf = new Map(listing.rows.map((r) => [r.pid, r.ppid || 0]));
+  const allPids = new Set(listing.rows.map((r) => r.pid));
+  // 候选/提示只考虑「不属于任何托管服务进程树」的进程
   const free = listing.rows.filter((r) => r.pid !== process.pid && !managedMatchFor(r.pid));
-  if (!free.length) return 0;
-
-  const ppidOf = new Map(free.map((r) => [r.pid, r.ppid || 0]));
   const targetsById = new Map(targets.map((s) => [s.id, s]));
 
   let details = null;
   try {
     details = await sampler.queryNodeProcessDetails({ ttlMs: 15000 });
   } catch { details = null; }
-
-  const claimed = new Map();
-  const consider = (serviceId, cand) => {
-    const prev = claimed.get(serviceId);
-    if (!prev || candidateRank(cand) < candidateRank(prev)) claimed.set(serviceId, cand);
-  };
-
-  // 信号 1：命令行里出现该服务的工作目录 —— 这是强信号，可以断定「就是它在跑」
-  for (const row of free) {
+  const cmdOf = new Map();
+  for (const row of listing.rows) {
     const cmd = details?.get(row.pid)?.commandLine;
-    if (!cmd) continue;
-    const m = matchByCommandLine(cmd);
-    if (!m || !targetsById.has(m.serviceId)) continue;
-    consider(m.serviceId, {
-      pid: row.pid,
-      matchedBy: 'commandline',
-      confidence: 'high',
-      detail: '命令行包含该服务的工作目录',
-      startedAt: details?.get(row.pid)?.startedAt || null,
-      depth: depthOf(row.pid, ppidOf),
-    });
+    if (cmd) cmdOf.set(row.pid, cmd);
   }
+  const portsOfPid = (pid) => portScanner.pick([pid]);
 
-  // 信号 2：服务声明的端口上有非托管的 node 进程在监听 —— 弱信号。
-  // 端口可能只是被别的程序占着（例如另一个项目撞了同一个默认端口），
-  // 因此这里只挂「可疑」提示、不改状态；用户确认后再「接管」。
-  const portClaims = new Map();
-  for (const svc of targets) {
-    const st = pm.stateOf(svc.id);
-    const p = svc.port || st.crashPort || null;
-    if (!p) continue;
-    if (!portClaims.has(p)) portClaims.set(p, []);
-    portClaims.get(p).push(svc);
-  }
   const freePids = new Set(free.map((r) => r.pid));
   // 注意：常规采样只在「有服务在跑」时刷新端口表（roots.length 判断），
   // 而外部运行探测恰恰只在「全部停止」时才有意义 —— 那时端口表可能是空的。
@@ -428,6 +497,81 @@ async function detectExternalRuns({ force = false } = {}) {
     await portScanner.refresh().catch(() => {});
   }
 
+  /** 对某服务做一次佐证校验 */
+  const corroborate = (svc, st, pid) => corroboratesLaunch({
+    pid,
+    ppidOf,
+    cmdOf,
+    portsOfPid,
+    roots: [svc.cwd, svc.root].filter(Boolean),
+    packageJsonPath: svc.packageJsonPath,
+    declaredPort: svc.port || st.crashPort || null,
+  });
+
+  let changed = 0;
+
+  // ---- 复核：已有的「外部运行中」是否仍然成立 ----
+  for (const { svc, st } of toVerify) {
+    const pid = st.pid;
+    if (!pid) continue;
+    // 进程已消失 → 交给心跳巡检处理（会记为「外部进程已退出」）
+    if (!allPids.has(pid)) continue;
+    const why = corroborate(svc, st, pid);
+    if (!why) {
+      if (pm.clearExternal(svc.id, `PID=${pid} 不再能佐证属于本服务`)) changed += 1;
+    }
+  }
+
+  if (!targets.length) return changed;
+
+  const claimed = new Map();
+  const consider = (serviceId, cand) => {
+    const prev = claimed.get(serviceId);
+    if (!prev || candidateRank(cand) < candidateRank(prev)) claimed.set(serviceId, cand);
+  };
+
+  // ---- 信号 1：命令行引用该服务，且能佐证是从该项目启动的 ----
+  const looseHints = new Map();
+  for (const row of free) {
+    const cmd = cmdOf.get(row.pid);
+    if (!cmd) continue;
+    const m = matchByCommandLine(cmd);
+    if (!m || !targetsById.has(m.serviceId)) continue;
+    const svc = targetsById.get(m.serviceId);
+    const st = pm.stateOf(svc.id);
+    const why = corroborate(svc, st, row.pid);
+    if (why) {
+      const target = topmostWrapper(row.pid, ppidOf, cmdOf);
+      consider(svc.id, {
+        pid: target,
+        matchedBy: 'commandline',
+        confidence: 'high',
+        detail: why === 'port'
+          ? `进程树里有进程监听该服务声明的端口`
+          : `命令行引用了该项目的 ${why === 'package.json' ? 'package.json' : 'node_modules'}，判定为由其脚本启动`,
+        startedAt: details?.get(target)?.startedAt || null,
+        depth: depthOf(target, ppidOf),
+      });
+    } else if (!looseHints.has(svc.id)) {
+      // 只是「碰了这个目录」，不代表服务在跑 → 降级为可疑提示
+      looseHints.set(svc.id, {
+        pid: row.pid,
+        confidence: 'low',
+        detail: `有进程在本项目目录下运行（PID ${row.pid}，${cmdLabel(cmd) || '未知命令'}），但不像该服务的启动命令`,
+        detectedAt: new Date().toISOString(),
+      });
+    }
+  }
+
+  // ---- 信号 2：服务声明的端口上有非托管的 node 进程在监听（弱信号） ----
+  const portClaims = new Map();
+  for (const svc of targets) {
+    const st = pm.stateOf(svc.id);
+    const p = svc.port || st.crashPort || null;
+    if (!p) continue;
+    if (!portClaims.has(p)) portClaims.set(p, []);
+    portClaims.get(p).push(svc);
+  }
   const hints = new Map();
   for (const [port, svcs] of portClaims) {
     if (svcs.length !== 1) continue; // 端口归属有歧义，宁可不动
@@ -449,14 +593,13 @@ async function detectExternalRuns({ force = false } = {}) {
     }
   }
 
-  let changed = 0;
   // 强信号：断言「外部运行中」
   for (const [serviceId, cand] of claimed) {
     if (pm.markExternal(serviceId, cand)) changed += 1;
   }
-  // 弱信号：挂提示，并清掉已经失效的旧提示
+  // 弱信号：挂提示（端口优先于「只是碰了目录」），并清掉已经失效的旧提示
   for (const svc of targets) {
-    const hint = hints.get(svc.id) || null;
+    const hint = hints.get(svc.id) || looseHints.get(svc.id) || null;
     if (pm.setExternalHint(svc.id, hint)) changed += 1;
   }
   return changed;

@@ -155,8 +155,8 @@ const hasEntry = computed(() => Boolean(entry.value.url));
     <div v-else-if="st.externalHint" class="banner warn">
       <span>?</span>
       <span class="grow">
-        {{ st.externalHint.detail }}（PID <span class="mono">{{ st.externalHint.pid }}</span>），
-        但无法确认就是该服务 —— 若确认，可接管它。
+        {{ st.externalHint.detail }}（PID <span class="mono">{{ st.externalHint.pid }}</span>）。
+        若确认它属于该服务，可接管。
       </span>
       <button class="btn sm" :disabled="busy" title="把该 PID 纳入托管，指标/端口/停止随即生效" @click="actions.adopt(service)">接管</button>
     </div>

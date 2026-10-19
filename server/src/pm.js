@@ -425,6 +425,33 @@ export class ProcessManager extends EventEmitter {
   }
 
   /**
+   * 撤销「外部运行中」的判定（复核不通过时使用）。
+   *
+   * 只对未被接管的声明生效：接管意味着用户明确认可了这个 PID，不该被自动撤销。
+   */
+  clearExternal(id, reason = '') {
+    const cur = this.runtime.get(id) || {};
+    if (cur.adopted === true) return false;
+    if (!cur.external && !cur.pid) return false;
+    const pid = cur.pid;
+    this.store.update(id, { lastPid: null });
+    this._set(id, {
+      status: STATUS.STOPPED,
+      pid: null,
+      adopted: false,
+      external: null,
+      externalHint: null,
+      lastError: null,
+    });
+    this.logs.append(
+      id,
+      `撤销「外部运行中」判定${pid ? `（PID=${pid}）` : ''}${reason ? `：${reason}` : ''}`,
+      'system',
+    );
+    return true;
+  }
+
+  /**
    * 设置/清除「端口可疑」提示（弱信号）。
    *
    * 端口上有非托管进程并不等于「这个服务正在跑」—— 端口也可能被别的程序占着
