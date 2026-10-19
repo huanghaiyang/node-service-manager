@@ -301,6 +301,11 @@ export class ProcessManager extends EventEmitter {
       effectivePort: s.effectivePort ?? null,
       // 崩溃时识别出的被占用端口（由 API 层补充占用者信息）
       crashPort: s.crashPort ?? null,
+      // 是否由外部启动（含"外部启动后被接管"两种情况）
+      adopted: s.adopted === true,
+      external: s.external || null,
+      // 弱信号：端口上有非托管进程，但不足以断定「就是它在跑」——只作提示
+      externalHint: s.externalHint || null,
       alive,
       plan: s.plan || null,
       logPaths: this.logs.paths(id),
@@ -328,6 +333,14 @@ export class ProcessManager extends EventEmitter {
           pid: last,
           startedAt: svc.lastStartedAt || null,
           lastError: '检测到上次托管启动的进程仍在运行，但已脱离本管理端控制（可能是管理端重启导致）',
+          adopted: false,
+          external: {
+            pid: last,
+            matchedBy: 'lastPid',
+            detail: '管理端上次退出前记录的 PID 仍然存活',
+            confidence: 'high',
+            detectedAt: new Date().toISOString(),
+          },
         });
         this.logs.loadTail(svc.id, 200);
         this.logs.append(svc.id, `检测到残留进程 PID=${last}，已标记为「外部运行中」`, 'system');
@@ -347,16 +360,134 @@ export class ProcessManager extends EventEmitter {
         if (s.status === STATUS.RUNNING || s.status === STATUS.STARTING || s.status === STATUS.ORPHANED) {
           if (!isAlive(s.pid)) {
             this.children.delete(id);
+            // 外部启动的进程没有 child 句柄，不会有 exit 事件，只能靠这次巡检发现它「自行停止」
+            const external = s.adopted === true || Boolean(s.external);
+            const lastError = external
+              ? '外部进程已退出（非本端启动，未收到退出事件）'
+              : (s.lastError || '进程已不存在（外部终止或异常退出）');
+            this.store.update(id, { lastPid: null });
             this._set(id, {
               status: STATUS.EXITED,
+              pid: null,
               stoppedAt: new Date().toISOString(),
-              lastError: s.lastError || '进程已不存在（外部终止或异常退出）',
+              lastError,
+              adopted: false,
+              external: null,
+              externalHint: null,
             });
+            this.logs.append(id, `${external ? '外部' : ''}进程 PID=${s.pid} 已退出，状态回落为「已退出」`, 'system');
           }
         }
       }
     }, 3000);
     if (this._reconcileTimer.unref) this._reconcileTimer.unref();
+  }
+
+  /**
+   * 标记「服务正在被外部运行」：在工具之外被启动（终端里 npm run dev 之类）。
+   *
+   * 这类进程没有 child 句柄，既收不到 exit 事件，指标/端口也无从归属。
+   * 探测器认出它之后先标记为 ORPHANED（UI 显示「外部运行中」），
+   * 用户可以「接管」把它纳入托管，或者「终止」它。
+   *
+   * @param {string} id
+   * @param {{pid:number, matchedBy:string, detail:string, confidence?:string, startedAt?:string|null}} info
+   * @returns {boolean} 状态是否真的发生了变化
+   */
+  markExternal(id, { pid, matchedBy, detail, confidence = 'high', startedAt = null }) {
+    if (!Number.isInteger(pid) || pid <= 0) return false;
+    const cur = this.runtime.get(id) || {};
+    // 已经在跟踪这个 pid（外部运行中或已接管）就不要再刷一次，避免 SSE 与日志抖动
+    if (cur.pid === pid) return false;
+    // 正在启停中不要插队
+    if ([STATUS.STARTING, STATUS.STOPPING].includes(cur.status)) return false;
+
+    this.store.update(id, { lastPid: pid });
+    this._set(id, {
+      status: STATUS.ORPHANED,
+      pid,
+      adopted: false,
+      externalHint: null,
+      external: {
+        pid,
+        matchedBy,
+        detail,
+        confidence,
+        detectedAt: new Date().toISOString(),
+      },
+      startedAt: startedAt || null,
+      stoppedAt: null,
+      lastError: null,
+      pendingStop: false,
+    });
+    this.logs.append(id, `检测到该服务正被外部运行：PID=${pid}（依据：${detail}）`, 'system');
+    return true;
+  }
+
+  /**
+   * 设置/清除「端口可疑」提示（弱信号）。
+   *
+   * 端口上有非托管进程并不等于「这个服务正在跑」—— 端口也可能被别的程序占着
+   * （这正是 image-clip 撞 8787 的场景）。所以这里只挂一个提示，不改状态、不声称在运行，
+   * 由用户判断是否接管。
+   */
+  setExternalHint(id, hint) {
+    const cur = this.runtime.get(id) || {};
+    const prev = cur.externalHint || null;
+    const sameAs = (a, b) => (a?.pid ?? null) === (b?.pid ?? null) && (a?.port ?? null) === (b?.port ?? null);
+    if (sameAs(prev, hint)) return false;
+    if (!hint) {
+      if (!prev) return false;
+      this._set(id, { externalHint: null });
+      return true;
+    }
+    this._set(id, { externalHint: hint });
+    this.logs.append(
+      id,
+      `端口 ${hint.port} 上有非托管进程 PID=${hint.pid} 在监听，可能是该服务的外部实例（确认后可「接管」）`,
+      'system',
+    );
+    return true;
+  }
+
+  /**
+   * 接管外部启动的进程：把它的 PID 纳入托管。
+   *
+   * 接管后指标、监听端口、停止/强制停止都可以正常工作；
+   * 因为它不是本端 spawn 的，没有 exit 事件，退出由 3s 巡检发现。
+   *
+   * @param {string} id
+   * @param {number|null} explicitPid 弱信号（端口提示）下由调用方显式给出目标 PID
+   */
+  adopt(id, explicitPid = null) {
+    const st = this.stateOf(id);
+    const target = explicitPid || st.pid || st.externalHint?.pid || null;
+    if (!target) throw Object.assign(new Error('没有可接管的外部进程'), { code: 'NOT_FOUND' });
+    if (!isAlive(target)) {
+      this.store.update(id, { lastPid: null });
+      this._set(id, { status: STATUS.STOPPED, pid: null, adopted: false, external: null, externalHint: null });
+      throw Object.assign(new Error('外部进程已经退出，无法接管'), { code: 'NOT_FOUND' });
+    }
+    this._set(id, {
+      status: STATUS.RUNNING,
+      pid: target,
+      adopted: true,
+      startedAt: st.startedAt || new Date().toISOString(),
+      lastError: null,
+      externalHint: null,
+      external: {
+        ...(st.external || st.externalHint || {}),
+        pid: target,
+        adoptedAt: new Date().toISOString(),
+      },
+    });
+    this.store.update(id, { lastPid: target });
+    this.logs.append(
+      id,
+      `已接管外部进程 PID=${target}：指标 / 监听端口 / 停止均可正常使用（未收到退出事件，退出靠巡检发现）`,
+      'system',
+    );
+    return this.stateOf(id);
   }
 
   /** 启动服务（可通过 portOverride 临时指定端口，用于端口冲突后换端口启动） */
@@ -433,8 +564,9 @@ export class ProcessManager extends EventEmitter {
       signal: null,
       lastError: null,
       autoRestartScheduled: false,
-      // 新一轮生命周期开始，清掉上一轮的「主动停止」意图
+      // 新一轮生命周期开始，清掉上一轮的「主动停止」意图与外部探测痕迹
       pendingStop: false,
+      externalHint: null,
       plan: { mode: plan.mode, display: plan.display, note: plan.note || '', exe: plan.exe, args: plan.args },
     });
     this.store.update(id, { lastPid: child.pid, lastStartedAt: new Date().toISOString() });
@@ -562,6 +694,9 @@ export class ProcessManager extends EventEmitter {
       status: STATUS.STOPPED,
       pid: null,
       stoppedAt: new Date().toISOString(),
+      adopted: false,
+      external: null,
+      externalHint: null,
     });
     this.logs.append(id, '已停止', 'system');
     return { stopped: true };
@@ -586,7 +721,15 @@ export class ProcessManager extends EventEmitter {
     const ok = await this.killTree(st.pid, { force: true, timeoutMs: 4000 });
     this.store.update(id, { lastPid: null });
     // 残留进程不属于本轮托管（没有 child 句柄，不会有 exit 事件），因此不涉及 pendingStop
-    this._set(id, { status: STATUS.STOPPED, pid: null, stoppedAt: new Date().toISOString(), lastError: null });
+    this._set(id, {
+      status: STATUS.STOPPED,
+      pid: null,
+      stoppedAt: new Date().toISOString(),
+      lastError: null,
+      adopted: false,
+      external: null,
+      externalHint: null,
+    });
     this.logs.append(id, `残留进程 PID=${st.pid} 已${ok ? '终止' : '尝试终止（结果未知）'}`, 'system');
     return { killed: ok };
   }

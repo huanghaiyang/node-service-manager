@@ -50,6 +50,7 @@ const hasEntry = computed(() => Boolean(entry.value.url));
           <h3 class="ellipsis">{{ service.name }}</h3>
           <span v-if="service.version" class="tag">{{ service.version }}</span>
           <span class="tag" :class="meta.color">{{ meta.label }}</span>
+          <span v-if="st.adopted" class="tag amber" title="该进程由外部启动，已被本工具接管">已接管</span>
           <span v-if="st.restarts" class="tag amber">重启 {{ st.restarts }}</span>
         </div>
         <div class="svc-path ellipsis mono" :title="service.packageJsonPath">
@@ -141,6 +142,24 @@ const hasEntry = computed(() => Boolean(entry.value.url));
       </span>
       <button class="btn danger sm" :disabled="busy" @click="openPortConflictForHint(service)">换端口启动</button>
     </div>
+    <div v-else-if="isOrphan" class="banner warn">
+      <span>⚠</span>
+      <span class="grow">
+        该服务正被<b>外部运行</b>（不是本工具启动的）。
+        <template v-if="st.external">
+          PID <span class="mono">{{ st.external.pid }}</span> · 依据：{{ st.external.detail }}
+          <span v-if="st.external.confidence === 'medium'" class="muted">（推断）</span>
+        </template>
+      </span>
+    </div>
+    <div v-else-if="st.externalHint" class="banner warn">
+      <span>?</span>
+      <span class="grow">
+        {{ st.externalHint.detail }}（PID <span class="mono">{{ st.externalHint.pid }}</span>），
+        但无法确认就是该服务 —— 若确认，可接管它。
+      </span>
+      <button class="btn sm" :disabled="busy" title="把该 PID 纳入托管，指标/端口/停止随即生效" @click="actions.adopt(service)">接管</button>
+    </div>
     <div v-else-if="st.lastError" class="banner warn">
       <span>⚠</span><span class="grow">{{ st.lastError }}</span>
     </div>
@@ -152,7 +171,8 @@ const hasEntry = computed(() => Boolean(entry.value.url));
 
     <footer class="svc-actions">
       <template v-if="isOrphan">
-        <button class="btn danger sm" :disabled="busy" @click="actions.killOrphan(service)">终止残留进程</button>
+        <button class="btn primary sm" :disabled="busy" title="纳入托管：指标/端口/停止随即生效" @click="actions.adopt(service)">接管</button>
+        <button class="btn danger sm" :disabled="busy" @click="actions.killOrphan(service)">终止</button>
       </template>
       <template v-else-if="isRunning">
         <button class="btn danger sm" :disabled="busy || isBusy" @click="actions.stop(service)">停止</button>

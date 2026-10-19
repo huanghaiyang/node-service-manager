@@ -381,7 +381,8 @@ const version = computed(() => pkgInfo.value?.version || '');
 
       <footer class="drawer-foot">
         <template v-if="st.status === 'orphaned'">
-          <button class="btn danger" :disabled="busy" @click="guard(() => actions.killOrphan(service))">终止残留进程</button>
+          <button class="btn primary" :disabled="busy" title="纳入托管：指标/端口/停止随即生效" @click="guard(() => actions.adopt(service))">接管</button>
+          <button class="btn danger" :disabled="busy" @click="guard(() => actions.killOrphan(service))">终止</button>
         </template>
         <template v-else-if="['running', 'starting'].includes(st.status)">
           <button class="btn danger" :disabled="busy" @click="guard(() => actions.stop(service))">停止</button>

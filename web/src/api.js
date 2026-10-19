@@ -44,6 +44,10 @@ export const api = {
   stop: (id, force = false) => request(`/api/services/${id}/stop`, { method: 'POST', body: { force } }),
   restart: (id, opts = {}) => request(`/api/services/${id}/restart`, { method: 'POST', body: opts }),
   killOrphan: (id) => request(`/api/services/${id}/kill-orphan`, { method: 'POST', body: {} }),
+  /** 接管「外部运行中」的进程，纳入托管（弱信号下需显式给出 pid） */
+  adopt: (id, pid) => request(`/api/services/${id}/adopt`, { method: 'POST', body: pid ? { pid } : {} }),
+  /** 立即触发一次外部运行探测 */
+  scanExternal: () => request('/api/external/scan', { method: 'POST', body: {} }),
   plan: (id) => request(`/api/services/${id}/plan`),
   /** 启动前端口预检：目标端口是否被占用、占用者是谁、随机可用端口 */
   preflight: (id, port) => request(`/api/services/${id}/preflight`, { query: { port } }),

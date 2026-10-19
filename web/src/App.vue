@@ -9,6 +9,7 @@ import {
   state, runningCount, totals, connect, disconnect, refresh, actions, toast,
   initProcessPanel, persistProcessPanel, loadNodeProcesses,
 } from './store.js';
+import { api } from './api.js';
 import { formatBytes, formatPercent } from './format.js';
 
 const showAdd = ref(false);
@@ -54,8 +55,10 @@ async function guard(fn) {
 
 async function refreshAll() {
   await guard(async () => {
+    // 手动刷新时顺带对账一次「被外部启动/外部停止」的服务
+    const scan = await api.scanExternal().catch(() => null);
     await refresh();
-    toast('已刷新', 'ok');
+    toast(scan?.changed ? `已刷新（发现 ${scan.changed} 个外部运行的服务）` : '已刷新', 'ok');
   });
 }
 

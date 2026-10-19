@@ -328,6 +328,140 @@ async function buildNodeProcessList({ details = null, force = false } = {}) {
   return { list, source: listing.source };
 }
 
+/* --------------------------- 外部运行探测器 ------------------------------- */
+
+let lastExternalScanAt = 0;
+
+/** 从 ppid 链推算深度（越浅越可能是进程树根） */
+function depthOf(pid, ppidOf) {
+  let depth = 0;
+  let cur = pid;
+  for (let i = 0; i < 32; i += 1) {
+    const parent = ppidOf.get(cur);
+    if (!parent || parent <= 0 || parent === cur) break;
+    depth += 1;
+    cur = parent;
+  }
+  return depth;
+}
+
+/** 候选优劣：先看信号强度，再看是不是树根（越浅越好） */
+function candidateRank(c) {
+  const conf = c.confidence === 'high' ? 0 : 1;
+  return conf * 1000 + Math.min(c.depth || 0, 99);
+}
+
+/**
+ * 探测「服务被外部启动」：用户绕过本工具，自己在终端里 `npm run dev`。
+ *
+ * 这类进程既没有 child 句柄（收不到 exit），也不在托管进程树里，
+ * 会导致界面显示「已停止」而机器上其实在跑 —— 最容易踩的坑。
+ *
+ * 归属用两个信号，强信号优先：
+ *   1. 命令行包含该服务的工作目录（WMI / ps 能拿到命令行时）—— 高置信
+ *   2. 该服务声明的端口上，有不属于任何托管树的 node 进程在监听 —— 中置信
+ * 多个服务声明同一端口时不归属（避免误判）。
+ *
+ * 只对当前「没在跑」的服务做探测，避免和正常托管流程抢状态。
+ */
+async function detectExternalRuns({ force = false } = {}) {
+  if (!force && Date.now() - lastExternalScanAt < 2500) return 0;
+  lastExternalScanAt = Date.now();
+
+  const targets = store.list().filter((svc) => {
+    const st = pm.stateOf(svc.id);
+    return !st.pid && ![STATUS.STARTING, STATUS.STOPPING, STATUS.RUNNING, STATUS.ORPHANED].includes(st.status);
+  });
+  if (!targets.length) return 0;
+
+  const listing = await sampler.listNodeProcesses({ ttlMs: 2500 });
+  // 排掉本进程，以及已经落在某个托管服务进程树里的进程
+  const free = listing.rows.filter((r) => r.pid !== process.pid && !managedMatchFor(r.pid));
+  if (!free.length) return 0;
+
+  const ppidOf = new Map(free.map((r) => [r.pid, r.ppid || 0]));
+  const targetsById = new Map(targets.map((s) => [s.id, s]));
+
+  let details = null;
+  try {
+    details = await sampler.queryNodeProcessDetails({ ttlMs: 15000 });
+  } catch { details = null; }
+
+  const claimed = new Map();
+  const consider = (serviceId, cand) => {
+    const prev = claimed.get(serviceId);
+    if (!prev || candidateRank(cand) < candidateRank(prev)) claimed.set(serviceId, cand);
+  };
+
+  // 信号 1：命令行里出现该服务的工作目录 —— 这是强信号，可以断定「就是它在跑」
+  for (const row of free) {
+    const cmd = details?.get(row.pid)?.commandLine;
+    if (!cmd) continue;
+    const m = matchByCommandLine(cmd);
+    if (!m || !targetsById.has(m.serviceId)) continue;
+    consider(m.serviceId, {
+      pid: row.pid,
+      matchedBy: 'commandline',
+      confidence: 'high',
+      detail: '命令行包含该服务的工作目录',
+      startedAt: details?.get(row.pid)?.startedAt || null,
+      depth: depthOf(row.pid, ppidOf),
+    });
+  }
+
+  // 信号 2：服务声明的端口上有非托管的 node 进程在监听 —— 弱信号。
+  // 端口可能只是被别的程序占着（例如另一个项目撞了同一个默认端口），
+  // 因此这里只挂「可疑」提示、不改状态；用户确认后再「接管」。
+  const portClaims = new Map();
+  for (const svc of targets) {
+    const st = pm.stateOf(svc.id);
+    const p = svc.port || st.crashPort || null;
+    if (!p) continue;
+    if (!portClaims.has(p)) portClaims.set(p, []);
+    portClaims.get(p).push(svc);
+  }
+  const freePids = new Set(free.map((r) => r.pid));
+  // 注意：常规采样只在「有服务在跑」时刷新端口表（roots.length 判断），
+  // 而外部运行探测恰恰只在「全部停止」时才有意义 —— 那时端口表可能是空的。
+  // 所以这里按需补刷一次，否则端口信号永远匹配不到。
+  if (freePids.size && Date.now() - (portScanner.sampledAt || 0) > 4000) {
+    await portScanner.refresh().catch(() => {});
+  }
+
+  const hints = new Map();
+  for (const [port, svcs] of portClaims) {
+    if (svcs.length !== 1) continue; // 端口归属有歧义，宁可不动
+    const svc = svcs[0];
+    if (claimed.has(svc.id)) continue; // 已有强信号，不必再挂提示
+    const st = pm.stateOf(svc.id);
+    // 「崩溃」状态已经有更精确的端口冲突诊断，不再叠加可疑提示
+    if (st.status === STATUS.CRASHED) continue;
+    for (const occupant of portScanner.whoListensOn(port)) {
+      if (!freePids.has(occupant.pid)) continue;
+      hints.set(svc.id, {
+        pid: occupant.pid,
+        port,
+        confidence: 'low',
+        detail: `端口 ${port} 上有非托管进程在监听`,
+        detectedAt: new Date().toISOString(),
+      });
+      break; // 一个服务只提示一个进程
+    }
+  }
+
+  let changed = 0;
+  // 强信号：断言「外部运行中」
+  for (const [serviceId, cand] of claimed) {
+    if (pm.markExternal(serviceId, cand)) changed += 1;
+  }
+  // 弱信号：挂提示，并清掉已经失效的旧提示
+  for (const svc of targets) {
+    const hint = hints.get(svc.id) || null;
+    if (pm.setExternalHint(svc.id, hint)) changed += 1;
+  }
+  return changed;
+}
+
 /**
  * 服务刚 spawn 时补采一次，尽量让卡片在「启动中」就能显示内存与进程数，
  * 不必干等下一个采样周期（默认 3s）。若此刻常规采样正在进行，本次会被跳过，
@@ -374,6 +508,11 @@ function startSamplingLoop() {
   const tick = async () => {
     try {
       await sampleOnce();
+      // 采样之后顺带探测「被外部启动」的服务（开销受缓存约束，见 detectExternalRuns）
+      await detectExternalRuns().catch((err) => {
+        console.error('[external] 外部运行探测失败:', err.message);
+        return 0;
+      });
       broadcast('snapshot', await snapshotPayload());
     } catch (err) {
       console.error('[metrics] 采样失败:', err.message);
@@ -662,6 +801,22 @@ app.post('/api/services/:id/restart', wrap(async (req, res) => {
   const portOverride = Number.isInteger(port) && port > 0 ? port : null;
   const state = await pm.restart(req.params.id, { portOverride });
   res.json({ ok: true, state, appliedPort: state.effectivePort ?? null });
+}));
+
+/** 接管「外部运行中」的进程：纳入托管后指标/端口/停止均可用 */
+app.post('/api/services/:id/adopt', wrap(async (req, res) => {
+  const svc = requireService(req);
+  const pid = Number(req.body?.pid);
+  // 强信号时状态里已有 pid；弱信号（端口可疑提示）需要调用方显式给出目标 PID
+  const state = pm.adopt(svc.id, Number.isInteger(pid) && pid > 0 ? pid : null);
+  scheduleQuickSample(400);
+  res.json({ ok: true, state });
+}));
+
+/** 立即触发一次外部运行探测（前端「刷新」可主动调用） */
+app.post('/api/external/scan', wrap(async (req, res) => {
+  const changed = await detectExternalRuns({ force: true });
+  res.json({ ok: true, changed, services: store.list().map((s) => serviceView(s)) });
 }));
 
 /* ---- Node 进程检测器 ---- */

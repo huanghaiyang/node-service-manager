@@ -359,6 +359,83 @@ check('目录浏览：返回上级路径', Boolean(listing.json?.parent), `paren
 const scan = await api('/api/scan', { method: 'POST', body: { dir: EXAMPLES_DIR, depth: 3 } });
 check('批量扫描 package.json', scan.ok && (scan.json?.results?.length || 0) > 0, `命中 ${scan.json?.results?.length} 个`);
 
+/* 9g. 外部运行探测：用户绕过本工具，自己在终端把服务跑起来
+       —— 必须能发现「它其实在跑」、能接管（指标/端口生效）、并在它自己退出后发现 */
+const EXT_PORT = 7801;
+const extAppDir = path.join(os.tmpdir(), 'sm-ext-app');
+await fs.promises.mkdir(extAppDir, { recursive: true });
+await fs.promises.writeFile(
+  path.join(extAppDir, 'package.json'),
+  JSON.stringify({ name: 'sm-ext-app', version: '1.0.0', private: true, type: 'module', scripts: { start: 'node index.js' } }, null, 2),
+  'utf8',
+);
+await fs.promises.writeFile(
+  path.join(extAppDir, 'index.js'),
+  [
+    "import http from 'node:http';",
+    `const PORT = Number(process.env.PORT ?? ${EXT_PORT});`,
+    "http.createServer((q, s) => s.end('ext')).listen(PORT, '127.0.0.1', () => console.log('ext listening', PORT));",
+    '',
+  ].join('\n'),
+  'utf8',
+);
+
+const extSvc = await api('/api/services', {
+  method: 'POST',
+  body: { packageJsonPath: path.join(extAppDir, 'package.json'), port: EXT_PORT, name: 'sm-ext-app' },
+});
+const extId = extSvc.json?.service?.id;
+if (extId) {
+  // 走「外部」路径：不经由治理工具启动，而是测试进程直接拉起
+  const extOut = fs.openSync(path.join(extAppDir, 'external.out'), 'a');
+  const extChild = (await import('node:child_process')).spawn(
+    process.execPath,
+    [path.join(extAppDir, 'index.js')],
+    { stdio: ['ignore', extOut, 'ignore'] },
+  );
+  await sleep(6000);
+  const extState = (await api(`/api/services/${extId}`)).json?.service;
+  // 命令行能拿到 → 强信号断言「外部运行中」；拿不到 → 只给端口弱信号提示、不改状态
+  const detailOk = Boolean((await api('/api/processes/node?refresh=1')).json?.detailAvailable);
+  if (detailOk) {
+    check('外部启动被判定为「外部运行中」（强信号）', extState?.state?.status === 'orphaned',
+      `status=${extState?.state?.status} pid=${extState?.state?.pid}`);
+    check('强信号依据为命令行且 PID 正确',
+      extState?.state?.external?.matchedBy === 'commandline' && extState?.state?.pid === extChild.pid,
+      JSON.stringify(extState?.state?.external || null));
+  } else {
+    check('只能靠端口时给出「可疑」提示', extState?.state?.externalHint?.pid === extChild.pid,
+      JSON.stringify(extState?.state?.externalHint || null));
+    check('弱信号不把「已停止」误标成「运行中」', extState?.state?.status === 'stopped',
+      `status=${extState?.state?.status}`);
+  }
+
+  const adoptedRes = await api(`/api/services/${extId}/adopt`, { method: 'POST', body: { pid: extChild.pid } });
+  check('可以接管外部进程', adoptedRes.ok && adoptedRes.json?.state?.status === 'running'
+    && adoptedRes.json?.state?.adopted === true, `status=${adoptedRes.json?.state?.status}`);
+  await sleep(4500);
+  const adoptedState = (await api(`/api/services/${extId}`)).json?.service;
+  check('接管后指标可用', (adoptedState?.metrics?.memoryBytes || 0) > 0,
+    `${((adoptedState?.metrics?.memoryBytes || 0) / 1048576).toFixed(1)} MB`);
+  check('接管后端口归属生效', (adoptedState?.ports || []).some((p) => p.port === EXT_PORT),
+    JSON.stringify(adoptedState?.ports || []));
+
+  // 模拟用户自己在终端里把这个进程关掉
+  try { extChild.kill('SIGKILL'); } catch { /* ignore */ }
+  await sleep(8000);
+  const goneState = (await api(`/api/services/${extId}`)).json?.service;
+  check('外部进程自行退落后状态回落', ['exited', 'stopped'].includes(goneState?.state?.status),
+    `status=${goneState?.state?.status}`);
+  check('退出原因指明是外部进程', /外部进程已退出/.test(goneState?.state?.lastError || ''),
+    goneState?.state?.lastError);
+  check('退出后 PID 清空', !goneState?.state?.pid, `pid=${goneState?.state?.pid}`);
+
+  try { fs.closeSync(extOut); } catch { /* ignore */ }
+  await api(`/api/services/${extId}?force=true`, { method: 'DELETE' });
+}
+await fs.promises.rm(extAppDir, { recursive: true, force: true }).catch(() => {});
+await sleep(400);
+
 /* 清理：保留托管记录以便前端演示，这里只删除本次测试产生的服务 */
 await api(`/api/services/${id}?force=true`, { method: 'DELETE' });
 check('移除托管记录', (await api('/api/services')).json?.services?.length === 0, '清理完成');
