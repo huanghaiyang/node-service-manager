@@ -140,6 +140,23 @@ async function compileSfc(absPath) {
   return { code: transformModuleCode(result, rel), styles };
 }
 
+/**
+ * 拷贝 web/public 下的静态资源到 dist 根目录（原样保留相对路径）。
+ * 目前主要是 favicon.svg；以后加 robots.txt / 图片也能直接放这里。
+ */
+async function copyPublic() {
+  const FROM = path.join(WEB, 'public');
+  if (!fs.existsSync(FROM)) return 0;
+  const files = await listFiles(FROM);
+  for (const abs of files) {
+    const rel = path.relative(FROM, abs);
+    const target = path.join(OUT, rel);
+    await fsp.mkdir(path.dirname(target), { recursive: true });
+    await fsp.copyFile(abs, target);
+  }
+  return files.length;
+}
+
 async function build() {
   const t0 = Date.now();
   await fsp.rm(OUT, { recursive: true, force: true });
@@ -182,6 +199,9 @@ async function build() {
   const vueTarget = path.join(OUT, 'vendor', 'vue.esm-browser.prod.js');
   await fsp.copyFile(vueDist, vueTarget);
 
+  // 静态资源（favicon 等）
+  const publicCount = await copyPublic();
+
   // index.html：head 中注入 importmap（把裸模块 'vue' 映射到本地运行时）与样式
   let html = await fsp.readFile(path.join(WEB, 'index.html'), 'utf8');
   const head = [
@@ -203,6 +223,9 @@ async function build() {
   console.log(`[build-web]   dist/index.html      ${kb(size(path.join(OUT, 'index.html')))}`);
   console.log(`[build-web]   dist/assets/app.css  ${kb(size(path.join(OUT, 'assets', 'app.css')))}`);
   console.log(`[build-web]   dist/vendor/vue...   ${kb(size(vueTarget))}`);
+  if (publicCount) {
+    console.log(`[build-web]   dist/favicon.svg    ${kb(size(path.join(OUT, 'favicon.svg')))}  （public 资源 ${publicCount} 个）`);
+  }
 }
 
 async function main() {

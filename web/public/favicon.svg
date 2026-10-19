@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Node 服务治理工具">
+  <!--
+    站点图标：与顶栏 logo 同一套视觉（蓝紫渐变圆角方块 + 白色齿轮）。
+    用 SVG 而不是位图，是为了在 16px 标签页与高 DPI 屏上都保持锐利，
+    同时不引入任何二进制产物与额外构建依赖。
+  -->
+  <defs>
+    <linearGradient id="brand" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4f9cf9" />
+      <stop offset="1" stop-color="#a97bf5" />
+    </linearGradient>
+  </defs>
+
+  <rect width="64" height="64" rx="16" fill="url(#brand)" />
+
+  <g fill="#fff">
+    <!-- 齿轮外环（evenodd 挖出中心的透明轴孔） -->
+    <path
+      fill-rule="evenodd"
+      d="M32 18a14 14 0 1 0 0 28 14 14 0 0 0 0-28zm0 7.5a6.5 6.5 0 1 1 0 13 6.5 6.5 0 0 1 0-13z"
+    />
+    <!-- 四个正交齿 -->
+    <rect x="28.75" y="9" width="6.5" height="10" rx="2" />
+    <rect x="28.75" y="45" width="6.5" height="10" rx="2" />
+    <rect x="9" y="28.75" width="10" height="6.5" rx="2" />
+    <rect x="45" y="28.75" width="10" height="6.5" rx="2" />
+    <!-- 旋转 45° 得到另外四个斜向齿 -->
+    <g transform="rotate(45 32 32)">
+      <rect x="28.75" y="9" width="6.5" height="10" rx="2" />
+      <rect x="28.75" y="45" width="6.5" height="10" rx="2" />
+      <rect x="9" y="28.75" width="10" height="6.5" rx="2" />
+      <rect x="45" y="28.75" width="10" height="6.5" rx="2" />
+    </g>
+  </g>
+</svg>
