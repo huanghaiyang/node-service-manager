@@ -499,6 +499,37 @@ if (fpId) {
 await fs.promises.rm(fpDir, { recursive: true, force: true }).catch(() => {});
 await sleep(400);
 
+/* 9i. 开机自启动与全局设置
+       ⚠ 只用 dryRun：绝不真的写注册表 / systemd / LaunchAgent ——
+       测试不该改变用户机器的开机行为。 */
+const autoStatus = (await api('/api/autostart')).json;
+check('能读取开机自启动状态', autoStatus?.supported === true,
+  `mechanism=${autoStatus?.mechanism} enabled=${autoStatus?.enabled}`);
+check('自启动状态给出注册位置与实际命令',
+  Boolean(autoStatus?.entry) && Boolean(autoStatus?.command), autoStatus?.command);
+
+const autoDry = await api('/api/autostart', { method: 'POST', body: { enabled: true, dryRun: true } });
+check('dryRun 能预览将要写入的内容', autoDry.ok && autoDry.json?.dryRun === true
+  && (autoDry.json?.files?.length || 0) > 0,
+  (autoDry.json?.files || []).map((f) => path.basename(f.path)).join(', '));
+check('dryRun 不改变真实自启动状态',
+  (await api('/api/autostart')).json?.enabled === autoStatus?.enabled);
+check('缺少 enabled 时自启动接口返回 400',
+  (await api('/api/autostart', { method: 'POST', body: {} })).status === 400);
+
+const before = (await api('/api/settings')).json?.settings;
+const flipped = await api('/api/settings', { method: 'PATCH', body: { restoreOnBoot: !before?.restoreOnBoot } });
+check('restoreOnBoot 可切换并生效',
+  flipped.ok && flipped.json?.settings?.restoreOnBoot === !before?.restoreOnBoot,
+  JSON.stringify(flipped.json?.settings));
+// 复原，避免测试污染真实设置
+await api('/api/settings', { method: 'PATCH', body: { restoreOnBoot: Boolean(before?.restoreOnBoot) } });
+check('设置已复原', (await api('/api/settings')).json?.settings?.restoreOnBoot === Boolean(before?.restoreOnBoot));
+
+const restoreRes = await api('/api/services/restore', { method: 'POST', body: {} });
+check('「恢复上次运行的服务」接口可用', restoreRes.ok && Array.isArray(restoreRes.json?.results),
+  `results=${JSON.stringify(restoreRes.json?.results)}`);
+
 /* 清理：保留托管记录以便前端演示，这里只删除本次测试产生的服务 */
 await api(`/api/services/${id}?force=true`, { method: 'DELETE' });
 check('移除托管记录', (await api('/api/services')).json?.services?.length === 0, '清理完成');

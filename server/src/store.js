@@ -22,6 +22,8 @@ const PERSIST_FIELDS = [
   'createdAt', 'updatedAt',
   // 运行期痕迹：管理端重启后据此识别残留进程
   'lastPid', 'lastStartedAt',
+  // 「期望运行」意图：开机自启动时据此决定要不要把它重新拉起来
+  'desiredRunning',
 ];
 
 function sanitize(raw, { isNew }) {
@@ -50,6 +52,9 @@ function sanitize(raw, { isNew }) {
     updatedAt: nowIso(),
     lastPid: Number.isInteger(Number(raw.lastPid)) && Number(raw.lastPid) > 0 ? Number(raw.lastPid) : null,
     lastStartedAt: raw.lastStartedAt || null,
+    // 用户意图：true = 这个服务「应该」在跑。只在显式停止时置 false，
+    // 崩溃保留 true（开机恢复时再试一次）
+    desiredRunning: Boolean(raw.desiredRunning),
   };
 }
 

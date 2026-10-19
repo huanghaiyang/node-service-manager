@@ -352,6 +352,41 @@ export class ProcessManager extends EventEmitter {
     this.startReconcileLoop();
   }
 
+  /**
+   * 恢复「上次还在运行」的服务（开机自启动或手动触发）。
+   *
+   * 依据是每个服务持久化的 desiredRunning（只有显式停止才会清掉，崩溃保留），
+   * 因此它恢复的是**用户的意图**，而不是「上一次是否恰好活着」。
+   *
+   * - 已经在跑的（本端托管 / 外部运行中 / 已被接管）一律跳过，避免重复实例；
+   * - 顺序启动并留间隔，避免多个服务同时抢端口与 IO。
+   *
+   * @param {{ staggerMs?: number, only?: string[] }} [opts]
+   */
+  async restoreDesiredServices({ staggerMs = 800, only = null } = {}) {
+    const results = [];
+    const wanted = this.store.list().filter((svc) => svc.desiredRunning && (!only || only.includes(svc.id)));
+    if (!wanted.length) return results;
+
+    for (const svc of wanted) {
+      const st = this.stateOf(svc.id);
+      if (st.pid || [STATUS.RUNNING, STATUS.STARTING, STATUS.STOPPING, STATUS.ORPHANED].includes(st.status)) {
+        results.push({ id: svc.id, name: svc.name, skipped: `already-${st.status}`, status: st.status });
+        continue;
+      }
+      try {
+        const state = await this.start(svc.id);
+        this.logs.append(svc.id, '开机自启动：按「期望运行」状态恢复', 'system');
+        results.push({ id: svc.id, name: svc.name, started: true, pid: state.pid, status: state.status });
+      } catch (err) {
+        this.logs.append(svc.id, `开机自启动恢复失败：${err.message}`, 'stderr');
+        results.push({ id: svc.id, name: svc.name, error: err.message });
+      }
+      if (staggerMs > 0) await sleep(staggerMs);
+    }
+    return results;
+  }
+
   startReconcileLoop() {
     if (this._reconcileTimer) return;
     this._reconcileTimer = setInterval(() => {
@@ -596,7 +631,7 @@ export class ProcessManager extends EventEmitter {
       externalHint: null,
       plan: { mode: plan.mode, display: plan.display, note: plan.note || '', exe: plan.exe, args: plan.args },
     });
-    this.store.update(id, { lastPid: child.pid, lastStartedAt: new Date().toISOString() });
+    this.store.update(id, { lastPid: child.pid, lastStartedAt: new Date().toISOString(), desiredRunning: true });
     this.logs.append(id, `已启动，PID=${child.pid}`, 'system');
 
     const startTs = Date.now();
@@ -714,7 +749,7 @@ export class ProcessManager extends EventEmitter {
       throw Object.assign(new Error('停止超时，进程可能仍在运行'), { code: 'STOP_TIMEOUT' });
     }
     this.children.delete(id);
-    this.store.update(id, { lastPid: null });
+    this.store.update(id, { lastPid: null, desiredRunning: false });
     // 注意：这里不覆盖 exitCode/signal，也不清除 pendingStop ——
     // 让稍后到达的 exit 事件负责消费停止意图并记录真实退出码。
     this._set(id, {
@@ -746,7 +781,7 @@ export class ProcessManager extends EventEmitter {
       return { killed: false };
     }
     const ok = await this.killTree(st.pid, { force: true, timeoutMs: 4000 });
-    this.store.update(id, { lastPid: null });
+    this.store.update(id, { lastPid: null, desiredRunning: false });
     // 残留进程不属于本轮托管（没有 child 句柄，不会有 exit 事件），因此不涉及 pendingStop
     this._set(id, {
       status: STATUS.STOPPED,

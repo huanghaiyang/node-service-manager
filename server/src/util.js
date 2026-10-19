@@ -17,7 +17,7 @@ let tmpSeq = 0;
  *   2. 避免大输出把子进程堵死。
  * 调用方（指标采集、端口探测）都依赖这个约定。
  */
-export function captureStdout(exe, args, { timeoutMs = 20000 } = {}) {
+export function captureStdout(exe, args, { timeoutMs = 20000, mergeStderr = false } = {}) {
   ensureDirs();
   if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR, { recursive: true });
   return new Promise((resolve) => {
@@ -31,7 +31,9 @@ export function captureStdout(exe, args, { timeoutMs = 20000 } = {}) {
     }
     let child;
     try {
-      child = spawn(exe, args, { stdio: ['ignore', fd, 'ignore'], windowsHide: true });
+      // mergeStderr：把 stderr 也写进同一个文件。命令的报错才是排查依据
+      // （例如 reg / systemctl 的失败原因），默认丢弃会让错误信息变成空的。
+      child = spawn(exe, args, { stdio: ['ignore', fd, mergeStderr ? fd : 'ignore'], windowsHide: true });
     } catch (err) {
       try { fs.closeSync(fd); } catch { /* ignore */ }
       try { fs.rmSync(outFile, { force: true }); } catch { /* ignore */ }

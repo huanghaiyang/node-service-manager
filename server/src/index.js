@@ -10,6 +10,8 @@ import { LogStore } from './logs.js';
 import { ProcessManager, STATUS, buildLaunchPlan } from './pm.js';
 import { ProcessSampler } from './metrics.js';
 import { PortScanner } from './ports.js';
+import { getAutostartStatus, setAutostart } from './autostart.js';
+import { readSettings, patchSettings } from './settings.js';
 import {
   analyzePackage, listDirectory, listDriveRoots, scanForPackages, PackageJsonError,
 } from './packageScanner.js';
@@ -962,6 +964,48 @@ app.post('/api/external/scan', wrap(async (req, res) => {
   res.json({ ok: true, changed, services: store.list().map((s) => serviceView(s)) });
 }));
 
+/* ---- 开机自启动 / 全局设置 ---- */
+
+app.get('/api/autostart', wrap(async (req, res) => {
+  res.json({ ok: true, ...(await getAutostartStatus()), settings: readSettings() });
+}));
+
+app.post('/api/autostart', wrap(async (req, res) => {
+  const body = req.body || {};
+  if (typeof body.enabled !== 'boolean') {
+    throw Object.assign(new Error('缺少 enabled（布尔）'), { code: 'BAD_REQUEST' });
+  }
+  const dryRun = body.dryRun === true;
+  const result = await setAutostart(body.enabled, { dryRun });
+  if (!result.ok) {
+    // 权限不足（例如受限环境无法写注册表）要如实告诉用户，而不是假装成功
+    throw Object.assign(new Error(result.error || '设置开机自启动失败'), { code: 'AUTOSTART_FAILED' });
+  }
+  broadcast('services-changed', { action: 'autostart', enabled: body.enabled });
+  res.json({ ok: true, dryRun, ...result, settings: readSettings() });
+}));
+
+app.get('/api/settings', wrap(async (req, res) => {
+  res.json({ ok: true, settings: readSettings(), autostart: await getAutostartStatus() });
+}));
+
+app.patch('/api/settings', wrap(async (req, res) => {
+  const body = req.body || {};
+  const patch = {};
+  if (typeof body.restoreOnBoot === 'boolean') patch.restoreOnBoot = body.restoreOnBoot;
+  if (body.restoreStaggerMs !== undefined) patch.restoreStaggerMs = Number(body.restoreStaggerMs);
+  const settings = await patchSettings(patch);
+  res.json({ ok: true, settings });
+}));
+
+/** 手动触发「恢复上次在运行的服务」；开机自启动走的是同一个函数 */
+app.post('/api/services/restore', wrap(async (req, res) => {
+  const settings = readSettings();
+  const results = await pm.restoreDesiredServices({ staggerMs: settings.restoreStaggerMs });
+  scheduleQuickSample(600);
+  res.json({ ok: true, results, services: store.list().map((s) => serviceView(s)) });
+}));
+
 /* ---- Node 进程检测器 ---- */
 
 app.get('/api/processes/node', wrap(async (req, res) => {
@@ -1130,6 +1174,24 @@ const server = app.listen(PORT, HOST, () => {
   // 预热能力探测：让界面首屏就能显示真实的指标采集器与端口探测方式，而不是「待探测」
   sampler.detect().catch(() => {});
   portScanner.detect().catch(() => {});
+
+  // 开机自启动：把「上次还在运行」的服务一并拉起来。
+  // 放在 reconcileOnBoot 之后 —— 先认清哪些进程其实还活着（外部运行中），避免重复拉起。
+  const bootSettings = readSettings();
+  if (bootSettings.restoreOnBoot) {
+    setTimeout(() => {
+      pm.restoreDesiredServices({ staggerMs: bootSettings.restoreStaggerMs })
+        .then((results) => {
+          const started = results.filter((r) => r.started).length;
+          const skipped = results.filter((r) => r.skipped).length;
+          const failed = results.filter((r) => r.error).length;
+          if (results.length) {
+            console.log(`  ▸ 开机恢复: 启动 ${started} / 跳过 ${skipped}（已在运行） / 失败 ${failed}`);
+          }
+        })
+        .catch((err) => console.error('  ▸ 开机恢复失败:', err.message));
+    }, 1200).unref?.();
+  }
 });
 
 // 端口占用等监听错误必须显式失败退出，否则会被 uncaughtException 兜住并静默退出，

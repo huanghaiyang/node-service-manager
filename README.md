@@ -25,6 +25,7 @@
 | 异常处理 | 异常退出自动重启（指数退避，最多 5 次/分钟，可选）；管理端重启后能识别「进程还在但已脱离托管」的残留服务并一键终止 |
 | 外部运行监听 | 服务被外部启动 / 自行退出 / 自行停止都能被发现；识别到外部启动的进程可以**接管**（指标、端口、停止随即生效） |
 | 站点图标 | SVG favicon（蓝紫渐变 + 齿轮，与顶栏 logo 同一套视觉），标签页与高分屏都清晰，且不引入二进制产物 |
+| 开机自启动 | 登录系统即自动拉起本工具（Windows Run 键 / systemd user / LaunchAgent，**均不需要管理员**），并可把「上次在运行」的服务一并恢复 |
 | 批量操作 | 全部启动 / 全部停止 |
 
 ### 界面截图
@@ -259,7 +260,44 @@ concurrently → npm → tsx/vite 好几个进程，在这里能一次看全，�
 > 而外部探测恰恰只在「全部停止」时才有意义 —— 所以探测器会自己按需补刷一次端口表，
 > 否则端口信号永远匹配不到。
 
-### 8. 查看日志
+### 8. 开机自启动
+
+顶栏「⚙ 设置」里有两件事，通常要一起开：
+
+**① 登录后自动启动治理工具**
+
+只写入**当前用户**级别的位置，不需要管理员 / root 权限：
+
+| 平台 | 机制 | 位置 |
+| --- | --- | --- |
+| Windows | 注册表 Run 键 | `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\NodeServiceManager` |
+| Linux | systemd 用户级单元 | `~/.config/systemd/user/node-service-manager.service` |
+| macOS | LaunchAgent | `~/Library/LaunchAgents/com.nodeservice-manager.plist` |
+
+Windows 上会额外生成一个 `wscript` 隐藏启动器（`.vbs` + `.cmd`），避免登录时弹出常驻黑框；
+日志落在 `data/autostart.log`。
+
+**端口和数据目录会被一并固化**——否则开机拉起的实例会跑在默认端口、读默认数据目录，
+和你手工启动的那个不是同一个。界面上「实际命令」一栏可以直接看到将要执行的完整命令。
+
+关闭时会连同注册项与启动器文件一起清理；重复关闭是幂等的。
+
+**② 启动时恢复服务**
+
+依据每个服务持久化的「期望运行」意图（`desiredRunning`）：
+
+- 启动成功 → 置为「是」
+- **显式停止 → 置为「否」**（所以手动停掉的服务不会在开机后自己回来）
+- 崩溃保留「是」（下次会再试一次）
+
+恢复时顺序启动、每个间隔默认 800ms，避免同时抢端口；**已经在跑的服务会被跳过**
+（含「外部运行中」/已接管的），不会产生重复实例。同一个函数也挂在
+`POST /api/services/restore` 上，界面上是「立即恢复一次」按钮。
+
+> Windows 上如果工具已经在运行又触发了一次自启动，第二个实例会因为端口被占而直接退出 1，
+> 并在 `data/autostart.log` 里留下 `[启动失败] 端口 HOST:PORT 已被占用`——这是预期行为。
+
+### 9. 查看日志
 详情抽屉的「日志」页：
 
 - 按 `全部 / stdout / stderr / 系统` 筛选，带条数统计
@@ -343,6 +381,8 @@ service-manager/
 │   ├── metrics.js              # 跨平台进程指标采集与进程树聚合
 │   ├── ports.js                # 监听端口探测（netstat / /proc / lsof）、占用反查、随机可用端口
 │   ├── logs.js                 # 日志落盘 + 增量 tail + 环形缓冲
+│   ├── autostart.js            # 开机自启动（Windows Run 键 / systemd user / LaunchAgent）
+│   ├── settings.js             # 全局设置持久化（restoreOnBoot 等）
 │   └── util.js                 # 进程存活探测、参数转义等
 ├── web/
 │   ├── index.html
@@ -409,6 +449,9 @@ npx vite build    # 打包压缩产物到 dist/
 | POST | `/api/services/:id/restart` | 重启（同样支持 `{ port }`） |
 | POST | `/api/services/:id/adopt` | 接管外部启动的进程（body 可带 `{ pid }`） |
 | POST | `/api/external/scan` | 立即探测一次「被外部启动」的服务 |
+| GET/POST | `/api/autostart` | 开机自启动状态 / 开关（POST `{ enabled, dryRun }`，dryRun 只预览） |
+| GET/PATCH | `/api/settings` | 全局设置（`restoreOnBoot`、`restoreStaggerMs`） |
+| POST | `/api/services/restore` | 恢复「上次在运行」的服务（与开机自启动同一套逻辑） |
 | POST | `/api/services/:id/kill-orphan` | 终止残留进程 |
 | GET | `/api/services/:id/plan` | 预览实际会执行的命令与 mode |
 | GET | `/api/services/:id/preflight?port=` | **启动前端口预检**：是否被占用、占用者信息、随机可用端口 |

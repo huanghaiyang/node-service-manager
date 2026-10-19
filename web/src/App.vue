@@ -5,6 +5,7 @@ import ServiceDetail from './components/ServiceDetail.vue';
 import AddServiceModal from './components/AddServiceModal.vue';
 import ProcessPanel from './components/ProcessPanel.vue';
 import PortConflictModal from './components/PortConflictModal.vue';
+import SettingsModal from './components/SettingsModal.vue';
 import {
   state, runningCount, totals, connect, disconnect, refresh, actions, toast,
   initProcessPanel, persistProcessPanel, loadNodeProcesses,
@@ -13,6 +14,7 @@ import { api } from './api.js';
 import { formatBytes, formatPercent } from './format.js';
 
 const showAdd = ref(false);
+const showSettings = ref(false);
 const detailId = ref(null);
 const keyword = ref('');
 const busy = ref(false);
@@ -157,6 +159,11 @@ async function afterCreated(svc) {
           <span class="tag blue">{{ state.nodeSummary.total }}</span>
           <span v-if="state.nodeSummary.managed" class="tag green">{{ state.nodeSummary.managed }} 已托管</span>
         </button>
+        <button
+          class="btn ghost"
+          title="开机自启动 / 启动时恢复服务"
+          @click="showSettings = true"
+        >⚙ 设置</button>
         <input v-model="keyword" class="input" style="width: 210px" placeholder="搜索名称 / 路径 / 端口…" />
         <span class="spacer" />
         <span class="hint">
@@ -205,6 +212,8 @@ async function afterCreated(svc) {
     />
 
     <AddServiceModal v-if="showAdd" @close="showAdd = false" @created="afterCreated" />
+
+    <SettingsModal v-if="showSettings" @close="showSettings = false" />
 
     <PortConflictModal
       v-if="state.portConflict"

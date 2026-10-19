@@ -48,6 +48,17 @@ export const api = {
   adopt: (id, pid) => request(`/api/services/${id}/adopt`, { method: 'POST', body: pid ? { pid } : {} }),
   /** 立即触发一次外部运行探测 */
   scanExternal: () => request('/api/external/scan', { method: 'POST', body: {} }),
+  /** 开机自启动状态 / 开关（dryRun 只预览会写什么，不动系统） */
+  autostart: () => request('/api/autostart'),
+  setAutostart: (enabled, dryRun = false) => request('/api/autostart', {
+    method: 'POST',
+    body: dryRun ? { enabled, dryRun: true } : { enabled },
+  }),
+  /** 全局设置 */
+  getSettings: () => request('/api/settings'),
+  patchSettings: (patch) => request('/api/settings', { method: 'PATCH', body: patch }),
+  /** 手动恢复「上次在运行」的服务（与开机自启动同一套逻辑） */
+  restoreServices: () => request('/api/services/restore', { method: 'POST', body: {} }),
   plan: (id) => request(`/api/services/${id}/plan`),
   /** 启动前端口预检：目标端口是否被占用、占用者是谁、随机可用端口 */
   preflight: (id, port) => request(`/api/services/${id}/preflight`, { query: { port } }),

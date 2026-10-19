@@ -29,6 +29,8 @@
 
 html, body, #app { height: 100%; }
 
+html, body { overflow-x: hidden; }
+
 body {
   margin: 0;
   background:
@@ -237,10 +239,24 @@ a { color: var(--accent); }
 .port-row:last-child { border-bottom: none; }
 .port-row .addr { font-family: var(--mono); font-size: 12.5px; }
 
+/* 键值型原始信息块（设置页里展示注册位置 / 启动器 / 实际命令） */
+.mono-block {
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  background: rgba(10, 14, 20, 0.45);
+  padding: 10px 12px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.9;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.mono-block .k { display: inline-block; min-width: 64px; color: var(--muted); }
+.mono-block .v { color: var(--text-dim); overflow-wrap: anywhere; }
+
 /* ---------- 端口冲突弹窗 ---------- */
 
-.occupant-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 5px 0; }
-.port-pick {
+.occupant-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 5px 0; }.port-pick {
   display: inline-flex; align-items: center; justify-content: center;
   min-width: 84px; padding: 7px 14px; border-radius: var(--radius-sm);
   border: 1px solid var(--border); background: var(--bg-soft);
@@ -305,9 +321,9 @@ a { color: var(--accent); }
 }
 @keyframes slideIn { from { transform: translateX(24px); opacity: .6; } to { transform: none; opacity: 1; } }
 
-.modal-wrap { align-items: center; justify-content: center; }
+.modal-wrap { align-items: center; justify-content: center; padding: 24px; overflow: auto; }
 .modal {
-  width: min(880px, 94vw); max-height: 90vh;
+  width: min(880px, 100%); max-width: 100%; max-height: 90vh;
   background: var(--bg-soft); border: 1px solid var(--border);
   border-radius: var(--radius); box-shadow: var(--shadow);
   display: flex; flex-direction: column; overflow: hidden;
