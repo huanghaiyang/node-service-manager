@@ -236,16 +236,77 @@ export function buildLaunchPlan(service) {
 /* ------------------------------ 进程管理器 --------------------------------- */
 
 /**
+ * 构造被托管进程的环境变量。
+ *
+ * **关键：绝不能把治理工具自己的 PORT 泄漏给子进程。**
+ * 大量 Node 应用用 `process.env.PORT || <默认端口>` 决定监听端口，
+ * 一旦继承了我们的 PORT，它们就会去抢治理工具自己的端口。
+ *
+ * 真实案例（torrent-vault）：它的 api 默认监听 4000，但继承到了本工具的 PORT=5178
+ * （来自开机自启动启动器里的 `set "PORT=5178"`），启动即报「端口 5178 已被占用」并退出；
+ * 外层 `concurrently` 与 `node --watch` 仍然活着，于是工具显示「运行中」而后端始终不可用。
+ * 项目本身没有任何问题。
+ *
+ * 同理，本工具的 `SM_*` 命名空间变量也不该传下去，避免子进程误读。
+ *
+ * @param {{ id: string, svc: object, portOverride?: number|null, baseEnv?: object }} opts
+ * @returns {{ env: Record<string, string>, effectivePort: number|null }}
+ */
+export function buildChildEnv({ id, svc = {}, portOverride = null, baseEnv = process.env }) {
+  const base = { ...baseEnv };
+  // 剔除会污染子进程的变量
+  delete base.PORT;
+  for (const key of Object.keys(base)) {
+    if (key.startsWith('SM_')) delete base[key];
+  }
+
+  const effectivePort = Number(portOverride) > 0 ? Number(portOverride) : (svc.port || null);
+  const env = {
+    ...base,
+    // 默认关闭子进程的颜色输出：我们的 stdout 是文件而不是 TTY，但很多工具仍会输出
+    // ANSI 颜色码，直接展示就成了乱码。放在 svc.env 之前，服务级 env 仍可覆盖
+    // （例如想保留颜色就设 FORCE_COLOR=1）。
+    NO_COLOR: '1',
+    FORCE_COLOR: '0',
+    ...(svc.env || {}),
+    SM_MANAGED: '1',
+    SM_SERVICE_ID: id,
+    SM_SERVICE_NAME: svc.name,
+  };
+  // 端口注入优先级最高：本次覆盖 > 服务配置。
+  // 注意 dotenv 默认不覆盖已存在的环境变量，所以这里注入的 PORT 会盖过项目 .env 里的值，
+  // 这正是「项目 .env 写的端口和前端代理对不上」时最省事的修法。
+  if (effectivePort) env.PORT = String(effectivePort);
+  return { env, effectivePort };
+}
+
+/**
  * 从日志尾部识别「端口被占用」并提取端口号。
  *
- * Node 生态里 EADDRINUSE 的呈现形式很杂：
+ * Node 生态里这类报错的呈现形式很杂，除了标准的 EADDRINUSE 之外，
+ * 应用/工具自己也会措辞，而这些恰恰是最常见的：
  *   Error: listen EADDRINUSE: address already in use 127.0.0.1:8787
  *   Error: listen EADDRINUSE: address already in use :::8787
+ *   [torrent-vault] 端口 5178 已被占用，请设置 PORT 环境变量后重试
+ *   Error: Port 5173 is already in use
  *   后面还可能跟着 stack 与 { address: '127.0.0.1', port: 8787 }
- * 所以先定位 EADDRINUSE，再在它附近若干行里找端口号。
+ *
+ * 所以先尝试「同一行里就能拿到端口的常见写法」，再退回 EADDRINUSE + 附近行找端口。
  */
 export function detectPortInUse(lines) {
   const text = (lines || []).map((l) => String(l?.text ?? l));
+
+  // 一、同一行直接带端口的自己人措辞
+  for (const line of text) {
+    const m = line.match(/端口\s*(\d{2,5})\s*(?:已被占用|被占用|已占用|冲突)/)
+      || line.match(/\bport\s+(\d{2,5})\s+is\s+already\s+in\s+use/i);
+    if (m) {
+      const port = Number(m[1]);
+      if (port > 0 && port <= 65535) return port;
+    }
+  }
+
+  // 二、标准的 EADDRINUSE / address already in use
   const start = text.findIndex((t) => /EADDRINUSE|address already in use/i.test(t));
   if (start < 0) return null;
   // 同一行里通常直接带端口：127.0.0.1:8787 / :::8787 / :8787
@@ -575,24 +636,7 @@ export class ProcessManager extends EventEmitter {
     this.logs.append(id, `准备启动：${plan.display}`, 'system');
     if (plan.note) this.logs.append(id, `启动方式：${plan.mode}（${plan.note}）`, 'system');
 
-    const env = {
-      ...process.env,
-      // 默认关闭子进程的颜色输出：我们的 stdout 是文件而不是 TTY，但很多工具仍会输出
-      // ANSI 颜色码，直接展示就成了乱码。放在 svc.env 之前，服务级 env 仍可覆盖
-      // （例如想保留颜色就设 FORCE_COLOR=1）。
-      NO_COLOR: '1',
-      FORCE_COLOR: '0',
-      ...svc.env,
-      SM_MANAGED: '1',
-      SM_SERVICE_ID: id,
-      SM_SERVICE_NAME: svc.name,
-    };
-    // 端口注入优先级：本次覆盖 > 服务配置。
-    // 注意 dotenv 默认不覆盖已存在的环境变量，所以这里注入的 PORT 会盖过项目 .env 里的值，
-    // 这正是「项目 .env 写的端口和前端代理对不上」时最省事的修法。
-    const effectivePort = Number(portOverride) > 0 ? Number(portOverride) : (svc.port || null);
-    if (effectivePort) env.PORT = String(effectivePort);
-
+    const { env, effectivePort } = buildChildEnv({ id, svc, portOverride });
     let child;
     try {
       child = spawn(plan.exe, plan.args, {

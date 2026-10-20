@@ -36,9 +36,16 @@ const LINUX_UNIT = path.join(LINUX_UNIT_DIR, LINUX_UNIT_NAME);
 const MAC_LABEL = 'com.nodeservice-manager';
 const MAC_PLIST = path.join(os.homedir(), 'Library', 'LaunchAgents', `${MAC_LABEL}.plist`);
 
-/** 需要固化进启动器的环境变量（只固化和默认值不同、或用户显式设过的） */
+/**
+ * 需要固化进启动器的环境变量。
+ *
+ * 这里用 `SM_PORT` 而不是 `PORT`：`PORT` 是 Node 应用最通用的约定变量，
+ * 若把它写进治理工具自身的进程环境，就容易被误传给被托管服务
+ * （曾经的 bug：torrent-vault 的 api 继承了 PORT=5178，去抢本工具的端口）。
+ * 虽然 spawn 子进程时已显式剔除 PORT，这里再避一次，双重保险。
+ */
 function bakedEnv() {
-  const env = { PORT: String(PORT) };
+  const env = { SM_PORT: String(PORT) };
   if (process.env.SM_DATA_DIR) env.SM_DATA_DIR = DATA_DIR;
   if (process.env.SM_HOST) env.SM_HOST = HOST;
   if (process.env.SM_SAMPLE_INTERVAL) env.SM_SAMPLE_INTERVAL = process.env.SM_SAMPLE_INTERVAL;
