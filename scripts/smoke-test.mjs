@@ -526,6 +526,27 @@ check('restoreOnBoot 可切换并生效',
 await api('/api/settings', { method: 'PATCH', body: { restoreOnBoot: Boolean(before?.restoreOnBoot) } });
 check('设置已复原', (await api('/api/settings')).json?.settings?.restoreOnBoot === Boolean(before?.restoreOnBoot));
 
+/* 9k. 任务栏托盘：只验状态与参数校验，不真的拉起图标（测试不该在用户任务栏弹东西） */
+const trayInfo = (await api('/api/tray')).json;
+check('能读取托盘状态', typeof trayInfo?.tray?.supported === 'boolean',
+  `supported=${trayInfo?.tray?.supported} mechanism=${trayInfo?.tray?.mechanism}`);
+check('托盘状态给出图标/脚本路径', Boolean(trayInfo?.tray?.icon) && Boolean(trayInfo?.tray?.script),
+  trayInfo?.tray?.script);
+check('托盘默认未运行', trayInfo?.tray?.running === false);
+check('缺少 enabled 时托盘接口返回 400',
+  (await api('/api/tray', { method: 'POST', body: {} })).status === 400);
+
+const summary = (await api('/api/summary')).json;
+check('轻量汇总接口可用（托盘轮询用）',
+  summary?.ok === true && typeof summary?.running === 'number' && typeof summary?.total === 'number',
+  JSON.stringify(summary));
+
+const traySet = await api('/api/settings', { method: 'PATCH', body: { trayOnStart: true } });
+check('trayOnStart 可设置', traySet.ok && traySet.json?.settings?.trayOnStart === true);
+await api('/api/settings', { method: 'PATCH', body: { trayOnStart: Boolean(before?.trayOnStart) } });
+check('trayOnStart 已复原',
+  (await api('/api/settings')).json?.settings?.trayOnStart === Boolean(before?.trayOnStart));
+
 const restoreRes = await api('/api/services/restore', { method: 'POST', body: {} });
 check('「恢复上次运行的服务」接口可用', restoreRes.ok && Array.isArray(restoreRes.json?.results),
   `results=${JSON.stringify(restoreRes.json?.results)}`);

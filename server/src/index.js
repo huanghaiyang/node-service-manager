@@ -12,6 +12,9 @@ import { ProcessSampler } from './metrics.js';
 import { PortScanner, defaultEntryUrl } from './ports.js';
 import { depthOf, candidateRank, corroboratesLaunch, topmostWrapper, cmdLabel } from './external.js';
 import { getAutostartStatus, setAutostart } from './autostart.js';
+import {
+  getTrayStatus, startTray, stopTray, disposeTray, isTraySupported,
+} from './tray.js';
 import { readSettings, patchSettings } from './settings.js';
 import {
   analyzePackage, listDirectory, listDriveRoots, scanForPackages, PackageJsonError,
@@ -587,9 +590,10 @@ const wrap = (fn) => (req, res) => {
     const code = err.code || 'INTERNAL';
     const status = code === 'NOT_FOUND' ? 404
       : code === 'ALREADY_RUNNING' || code === 'ORPHANED' ? 409
-        : ['INVALID_PACKAGE_JSON', 'EMPTY_PATH', 'PATH_NOT_FOUND', 'PACKAGE_NOT_FOUND', 'NOT_PACKAGE_JSON',
-          'PARSE_FAILED', 'NO_SCRIPT', 'NO_ENTRY', 'SCRIPT_NOT_FOUND', 'NO_COMMAND', 'BAD_REQUEST'].includes(code) ? 400
-          : 500;
+        : ['UNSUPPORTED', 'AUTOSTART_FAILED', 'TRAY_FAILED'].includes(code) ? 501
+          : ['INVALID_PACKAGE_JSON', 'EMPTY_PATH', 'PATH_NOT_FOUND', 'PACKAGE_NOT_FOUND', 'NOT_PACKAGE_JSON',
+            'PARSE_FAILED', 'NO_SCRIPT', 'NO_ENTRY', 'SCRIPT_NOT_FOUND', 'NO_COMMAND', 'BAD_REQUEST'].includes(code) ? 400
+            : 500;
     if (status >= 500) console.error(`[api] ${req.method} ${req.originalUrl}:`, err);
     res.status(status).json({ ok: false, code, message: err.message });
   });
@@ -906,8 +910,49 @@ app.patch('/api/settings', wrap(async (req, res) => {
   const patch = {};
   if (typeof body.restoreOnBoot === 'boolean') patch.restoreOnBoot = body.restoreOnBoot;
   if (body.restoreStaggerMs !== undefined) patch.restoreStaggerMs = Number(body.restoreStaggerMs);
+  if (typeof body.trayOnStart === 'boolean') patch.trayOnStart = body.trayOnStart;
   const settings = await patchSettings(patch);
   res.json({ ok: true, settings });
+}));
+
+/* ---- 任务栏托盘 ---- */
+
+/**
+ * 极轻量的状态汇总，给托盘脚本每 5 秒轮询用。
+ * 不复用 /api/services：那个接口要拼完整视图（指标/端口/入口），对托盘来说太重。
+ */
+app.get('/api/summary', wrap(async (req, res) => {
+  const list = store.list();
+  const running = list.filter((svc) => pm.stateOf(svc.id).status === STATUS.RUNNING).length;
+  res.json({ ok: true, running, total: list.length, tray: getTrayStatus().running });
+}));
+
+app.get('/api/tray', wrap(async (req, res) => {
+  res.json({ ok: true, tray: getTrayStatus(), settings: readSettings() });
+}));
+
+app.post('/api/tray', wrap(async (req, res) => {
+  const body = req.body || {};
+  if (typeof body.enabled !== 'boolean') {
+    throw Object.assign(new Error('缺少 enabled 布尔值'), { code: 'BAD_REQUEST' });
+  }
+  if (body.enabled && !isTraySupported()) {
+    throw Object.assign(new Error(getTrayStatus().detail), { code: 'UNSUPPORTED' });
+  }
+
+  const result = body.enabled ? await startTray({ port: PORT }) : stopTray();
+  if (!result.ok) {
+    throw Object.assign(new Error(result.error || '托盘操作失败'), { code: 'TRAY_FAILED' });
+  }
+  if (body.enabled) {
+    // 打开托盘 = 以后开机/启动时也要有，否则"点一下才出现"很反直觉
+    await patchSettings({ trayOnStart: true });
+  } else if (body.persist !== false) {
+    await patchSettings({ trayOnStart: false });
+  }
+  const tray = getTrayStatus();
+  broadcast('services-changed', { action: 'tray', running: tray.running });
+  res.json({ ok: true, tray, settings: readSettings() });
 }));
 
 /** 手动触发「恢复上次在运行的服务」；开机自启动走的是同一个函数 */
@@ -1202,6 +1247,16 @@ const server = app.listen(PORT, HOST, () => {
         .catch((err) => console.error('  ▸ 开机恢复失败:', err.message));
     }, 1200).unref?.();
   }
+
+  // 任务栏托盘：与「是否开机自启」联动，但托盘更轻，直接同步起
+  if (bootSettings.trayOnStart && isTraySupported()) {
+    startTray({ port: PORT })
+      .then((r) => {
+        if (r.ok) console.log(`  ▸ 托盘:     已显示（PID ${r.pid}）`);
+        else console.error(`  ▸ 托盘:     启动失败 ${r.error}`);
+      })
+      .catch((err) => console.error('  ▸ 托盘启动失败:', err.message));
+  }
 });
 
 // 端口占用等监听错误必须显式失败退出，否则会被 uncaughtException 兜住并静默退出，
@@ -1220,6 +1275,7 @@ server.on('error', (err) => {
 function shutdown(signal) {
   console.log(`\n[service-manager] 收到 ${signal}，正在退出（托管的服务进程会继续运行，下次启动时可识别为「外部运行中」）…`);
   clearInterval(sampleTimer);
+  disposeTray();
   pm.dispose();
   store.flush();
   for (const res of sseClients) {

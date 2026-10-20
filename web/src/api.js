@@ -59,6 +59,9 @@ export const api = {
   patchSettings: (patch) => request('/api/settings', { method: 'PATCH', body: patch }),
   /** 手动恢复「上次在运行」的服务（与开机自启动同一套逻辑） */
   restoreServices: () => request('/api/services/restore', { method: 'POST', body: {} }),
+  /** 任务栏托盘 */
+  getTray: () => request('/api/tray'),
+  setTray: (enabled) => request('/api/tray', { method: 'POST', body: { enabled } }),
   plan: (id) => request(`/api/services/${id}/plan`),
   /** 启动前端口预检：目标端口是否被占用、占用者是谁、随机可用端口 */
   preflight: (id, port) => request(`/api/services/${id}/preflight`, { query: { port } }),

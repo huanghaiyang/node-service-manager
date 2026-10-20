@@ -157,6 +157,19 @@ async function copyPublic() {
   return files.length;
 }
 
+/**
+ * 生成 favicon.ico。
+ *
+ * 与任务栏托盘复用同一份图标代码（server/src/icon.js 用纯 JS 拼 ICO 字节），
+ * 这样两处图形永远一致，也不用往仓库里塞二进制。
+ */
+async function writeFaviconIco() {
+  const { buildIco } = await import(new URL('../server/src/icon.js', import.meta.url).href);
+  const target = path.join(OUT, 'favicon.ico');
+  await fsp.writeFile(target, buildIco({ sizes: [16, 32, 48] }));
+  return target;
+}
+
 async function build() {
   const t0 = Date.now();
   await fsp.rm(OUT, { recursive: true, force: true });
@@ -201,6 +214,7 @@ async function build() {
 
   // 静态资源（favicon 等）
   const publicCount = await copyPublic();
+  const icoPath = await writeFaviconIco();
 
   // index.html：head 中注入 importmap（把裸模块 'vue' 映射到本地运行时）与样式
   let html = await fsp.readFile(path.join(WEB, 'index.html'), 'utf8');
@@ -226,6 +240,7 @@ async function build() {
   if (publicCount) {
     console.log(`[build-web]   dist/favicon.svg    ${kb(size(path.join(OUT, 'favicon.svg')))}  （public 资源 ${publicCount} 个）`);
   }
+  console.log(`[build-web]   dist/favicon.ico    ${kb(size(icoPath))}  （与托盘图标同一份图形）`);
 }
 
 async function main() {

@@ -26,6 +26,7 @@
 | 外部运行监听 | 服务被外部启动 / 自行退出 / 自行停止都能被发现；识别到外部启动的进程可以**接管**（指标、端口、停止随即生效） |
 | 站点图标 | SVG favicon（蓝紫渐变 + 齿轮，与顶栏 logo 同一套视觉），标签页与高分屏都清晰，且不引入二进制产物 |
 | 开机自启动 | 登录系统即自动拉起本工具（Windows Run 键 / systemd user / LaunchAgent，**均不需要管理员**），并可把「上次在运行」的服务一并恢复 |
+| 任务栏托盘 | **Windows 通知区域图标**：双击打开控制台、右键「启动全部 / 停止全部 / 刷新状态」、悬停显示「N/M 运行中」；用系统自带 WinForms 实现，不引入 Electron/原生依赖 |
 | 批量操作 | 全部启动 / 全部停止 |
 
 ### 界面截图
@@ -317,6 +318,35 @@ Windows 上会额外生成一个 `wscript` 隐藏启动器（`.vbs` + `.cmd`）�
 > Windows 上如果工具已经在运行又触发了一次自启动，第二个实例会因为端口被占而直接退出 1，
 > 并在 `data/autostart.log` 里留下 `[启动失败] 端口 HOST:PORT 已被占用`——这是预期行为。
 
+### 8.5 任务栏托盘（Windows）
+
+一个「本机常驻服务 + 浏览器控制台」的组合，最怕的是为了看一眼状态专门留一个浏览器标签。
+托盘给一个常驻入口，在「⚙ 设置 → 任务栏托盘」里一键显示/隐藏。
+
+| 交互 | 行为 |
+| --- | --- |
+| 悬停 | `服务治理 · 3/6 运行中`（每 5s 刷新，走极轻量的 `/api/summary`） |
+| 双击图标 | 浏览器打开控制台 |
+| 右键 → 打开控制台 | 同上 |
+| 右键 → 启动全部服务 / 停止全部服务 | 调 `start-all` / `stop-all`，结果用气泡提示 |
+| 右键 → 刷新状态 | 立刻重新取一次汇总 |
+| 右键 → 退出托盘 | 图标消失（工具本身继续运行） |
+
+**实现方式（有意为之）**：不引入 Electron / node-systray 之类需要原生编译的依赖
+（项目坚持零原生依赖，受限构建环境也编译不了），而是生成一段 PowerShell 脚本，
+用 Windows 自带的 WinForms `NotifyIcon`。图标由 `server/src/icon.js` **用纯 JS 拼 ICO 字节**生成
+（渐变圆角方块 + 白色齿轮，与 `favicon.svg` 同一套视觉），构建时顺带产出 `dist/favicon.ico`。
+
+相关文件都在 `data/tray/`：`app.ico`（图标）、`tray.ps1`（脚本）、`tray.log`（输出）。
+
+> 两个实现细节踩过坑：
+> 1. `.ps1` **必须写 UTF-8 BOM**。Windows PowerShell 5.1 在没有 BOM 时按系统 ANSI 代码页读取，
+>    中文菜单文字会变成乱码，甚至把引号吃掉导致语法错误（实测直接解析失败）。
+> 2. 托盘脚本每 5 秒轮询的是 `/api/summary`（只有计数），而不是 `/api/services`
+>    （要拼完整视图，太重）。治理工具连续 1 分钟不可达时托盘会自动退出，避免留下无主图标。
+
+非 Windows 平台 `GET /api/tray` 会明确返回 `supported: false` 与原因，不会假装成功。
+
 ### 9. 查看日志
 详情抽屉的「日志」页：
 
@@ -403,7 +433,9 @@ service-manager/
 │   ├── ports.js                # 监听端口探测（netstat / /proc / lsof）、占用反查、随机可用端口
 │   ├── logs.js                 # 日志落盘 + 增量 tail + 环形缓冲
 │   ├── autostart.js            # 开机自启动（Windows Run 键 / systemd user / LaunchAgent）
-│   ├── settings.js             # 全局设置持久化（restoreOnBoot 等）
+│   ├── settings.js             # 全局设置持久化（restoreOnBoot / trayOnStart 等）
+│   ├── tray.js                 # 任务栏托盘（PowerShell NotifyIcon）
+│   ├── icon.js                 # 纯 JS 生成多尺寸 .ico（托盘 + favicon 共用）
 │   └── util.js                 # 进程存活探测、参数转义、日志清洗、临时文件清理
 ├── web/
 │   ├── index.html
@@ -426,7 +458,8 @@ service-manager/
     ├── services.json           # 托管服务清单
     ├── logs/<id>.out.log       # 子进程 stdout
     ├── logs/<id>.err.log       # 子进程 stderr
-    └── logs/<id>.system.log    # 启停等系统事件
+    ├── logs/<id>.system.log    # 启停等系统事件
+    └── tray/                   # 托盘：app.ico / tray.ps1 / tray.log
 ```
 
 ### 前端构建为什么不用 Vite
@@ -475,6 +508,8 @@ npx vite build    # 打包压缩产物到 dist/
 | GET/POST | `/api/autostart` | 开机自启动状态 / 开关（POST `{ enabled, dryRun }`，dryRun 只预览） |
 | GET/PATCH | `/api/settings` | 全局设置（`restoreOnBoot`、`restoreStaggerMs`） |
 | POST | `/api/services/restore` | 恢复「上次在运行」的服务（与开机自启动同一套逻辑） |
+| GET/POST | `/api/tray` | 任务栏托盘状态 / 显示隐藏（POST `{ enabled }`；非 Windows 返回 501） |
+| GET | `/api/summary` | 极轻量状态汇总（`running` / `total`），供托盘每 5s 轮询 |
 | POST | `/api/services/:id/kill-orphan` | 终止残留进程 |
 | GET | `/api/services/:id/plan` | 预览实际会执行的命令与 mode |
 | GET | `/api/services/:id/preflight?port=` | **启动前端口预检**：是否被占用、占用者信息、随机可用端口 |
@@ -535,12 +570,12 @@ curl -N http://127.0.0.1:5178/api/events
 分两层：**单元测试**（毫秒级，纯函数）+ **端到端冒烟测试**（真起进程、真占端口）。
 
 ```bash
-npm test              # 单元测试（72 条，~0.1s）
+npm test              # 单元测试（89 条，~0.15s）
 npm run test:unit     # 同上
 
 npm run build
 npm start             # 另开一个终端
-npm run test:smoke    # 端到端（81 条，~3 分钟）
+npm run test:smoke    # 端到端（88 条，~3 分钟）
 npm run test:all      # 先单元、再冒烟
 ```
 
@@ -558,6 +593,9 @@ npm run test:all      # 先单元、再冒烟
 | `settings` | 非法值必须被忽略（否则会冲掉用户配置） |
 | `buildLaunchPlan` | 启动方式解析 |
 | `buildChildEnv` | **子进程环境不能继承工具的 `PORT`**（真实事故：torrent-vault 被顶到 5178） |
+| `buildIco` / `samplePixel` | 托盘与 favicon 共用的图标：ICO 头、条目偏移、DIB 高度、形状与渐变 |
+| `buildTrayScript` | 托盘菜单齐全、只轮询轻量接口、路径里的单引号被转义 |
+| `ensureTrayAssets` | `.ps1` 必须带 UTF-8 BOM（否则 PowerShell 5.1 按 ANSI 读，中文乱码并解析失败） |
 
 > 运行器是 `scripts/unit-test.mjs` 而不是 `node --test test/`：
 > 后者默认给每个测试文件起子进程，而受限环境里带管道的 `spawn` 会被拒绝（EPERM），
@@ -620,13 +658,13 @@ npm run test:smoke
   [PASS] 批量扫描 package.json  — 命中 1 个
   [PASS] 移除托管记录  — 清理完成
 
-=== 结果: 81/81 通过 ===
+=== 结果: 88/88 通过 ===
 ```
 
-> 上表是核心链路的输出快照；当前完整套件共 **81 条**，另外 39 条覆盖：
+> 上表是核心链路的输出快照；当前完整套件共 **88 条**，另外 46 条覆盖：
 > 日志 ANSI 清洗（5）、崩溃端口诊断（7）、外部运行探测与接管（6）、
 > 弱信号不误判状态（2）、命令行只「碰了」项目目录时不误判（2）、
-> 开机自启动与设置往返（8）、批量启动端口预检（9）。
+> 开机自启动与设置往返（8）、批量启动端口预检（9）、任务栏托盘（5）。
 
 最后几条是开发过程中定位到真实缺陷后补的回归用例，值得单独说明：
 

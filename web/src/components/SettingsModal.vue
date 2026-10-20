@@ -12,18 +12,25 @@ const error = ref('');
 
 const auto = ref(null);       // 自启动状态（后端返回）
 const settings = ref({ restoreOnBoot: false, restoreStaggerMs: 800 });
+const trayState = ref(null);
 
 const enabled = computed(() => Boolean(auto.value?.enabled));
 const supported = computed(() => auto.value?.supported !== false);
 const mechanism = computed(() => auto.value?.mechanismLabel || '—');
+const trayOn = computed(() => Boolean(trayState.value?.running));
+const traySupported = computed(() => trayState.value?.supported !== false);
 
 async function load() {
   loading.value = true;
   error.value = '';
   try {
-    const res = await api.getSettings();
+    const [res, trayRes] = await Promise.all([
+      api.getSettings(),
+      api.getTray().catch(() => null),
+    ]);
     settings.value = res.settings;
     auto.value = res.autostart;
+    trayState.value = trayRes?.tray || null;
   } catch (err) {
     error.value = err.message;
   } finally {
@@ -32,6 +39,23 @@ async function load() {
 }
 
 onMounted(load);
+
+async function toggleTray() {
+  const next = !trayOn.value;
+  busy.value = true;
+  error.value = '';
+  try {
+    const res = await api.setTray(next);
+    trayState.value = res.tray;
+    settings.value = res.settings;
+    toast(next ? '已显示任务栏托盘' : '已隐藏任务栏托盘', 'ok');
+  } catch (err) {
+    error.value = err.message;
+    toast(err.message, 'err', 8000);
+  } finally {
+    busy.value = false;
+  }
+}
 
 async function toggleAutostart() {
   busy.value = true;
@@ -179,6 +203,47 @@ async function restoreNow() {
               <span class="grow">
                 已开启自启动但未开启服务恢复：开机后工具会起来，但托管的服务仍然不会自动运行。
                 两者通常要一起开。
+              </span>
+            </div>
+          </div>
+
+          <!-- 任务栏托盘 -->
+          <div class="section-title">任务栏托盘</div>
+          <div class="card" style="padding: 14px 16px">
+            <div class="row" style="gap: 10px; align-items: center">
+              <div class="grow" style="min-width: 0">
+                <div class="row" style="gap: 8px">
+                  <b>在任务栏通知区域显示图标</b>
+                  <span class="tag" :class="trayOn ? 'green' : ''">{{ trayOn ? '已显示' : '未显示' }}</span>
+                  <span v-if="!traySupported" class="tag amber">当前平台不支持</span>
+                </div>
+                <div class="hint" style="margin-top: 5px">
+                  双击图标打开控制台；右键可「启动全部 / 停止全部 / 刷新状态」。开启后会随工具一起启动。
+                </div>
+              </div>
+              <button
+                class="btn"
+                :class="trayOn ? '' : 'primary'"
+                :disabled="busy || !traySupported"
+                @click="toggleTray"
+              >
+                <span v-if="busy" class="spin" /> {{ trayOn ? '隐藏托盘' : '显示托盘' }}
+              </button>
+            </div>
+
+            <div v-if="trayState?.detail" class="hint" style="margin-top: 8px">{{ trayState.detail }}</div>
+
+            <div v-if="trayState" class="mono-block" style="margin-top: 12px">
+              <div><span class="k">图标</span> <span class="v">{{ trayState.icon }}</span></div>
+              <div><span class="k">脚本</span> <span class="v">{{ trayState.script }}</span></div>
+              <div v-if="trayState.pid"><span class="k">进程</span> <span class="v mono">PID {{ trayState.pid }}</span></div>
+            </div>
+
+            <div class="banner info" style="margin-top: 12px; font-size: 12px">
+              <span>ℹ</span>
+              <span class="grow">
+                托盘用系统自带的 WinForms NotifyIcon 实现，<b>不引入 Electron / 原生依赖</b>；
+                图标由工具自己生成 <span class="mono">.ico</span>。仅 Windows 可用。
               </span>
             </div>
           </div>

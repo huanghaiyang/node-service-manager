@@ -19,6 +19,8 @@ const DEFAULTS = {
   restoreOnBoot: false,
   /** 顺序恢复时每个服务之间的间隔（毫秒），避免同时抢端口/CPU */
   restoreStaggerMs: 800,
+  /** 工具启动时同时显示任务栏托盘（仅 Windows） */
+  trayOnStart: false,
 };
 
 let cache = null;
@@ -29,6 +31,7 @@ function normalize(raw) {
     if (typeof raw.restoreOnBoot === 'boolean') out.restoreOnBoot = raw.restoreOnBoot;
     const stagger = Number(raw.restoreStaggerMs);
     if (Number.isFinite(stagger) && stagger >= 0 && stagger <= 60000) out.restoreStaggerMs = stagger;
+    if (typeof raw.trayOnStart === 'boolean') out.trayOnStart = raw.trayOnStart;
   }
   return out;
 }
@@ -53,6 +56,7 @@ export async function patchSettings(patch) {
     const stagger = Number(patch.restoreStaggerMs);
     if (Number.isFinite(stagger) && stagger >= 0 && stagger <= 60000) next.restoreStaggerMs = stagger;
   }
+  if (patch && typeof patch.trayOnStart === 'boolean') next.trayOnStart = patch.trayOnStart;
   cache = normalize(next);
   await fsp.mkdir(path.dirname(SETTINGS_FILE), { recursive: true });
   await fsp.writeFile(TMP_FILE, JSON.stringify(cache, null, 2), 'utf8');
