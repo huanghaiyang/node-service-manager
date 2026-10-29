@@ -23,6 +23,7 @@
 | Node 进程检测器 | 默认隐藏的侧边栏，一键展开后列出本机所有 node 进程（PID / 内存 / CPU / 各自监听的端口 / 命令行），并**标记出属于已托管服务的那些** |
 | 日志 | 子进程 stdout/stderr 落盘留存 + 内存环形缓冲，支持按流筛选、关键字搜索（高亮）、自动滚动、复制、清空；管理端重启后仍可回溯历史日志。**自动清洗 ANSI 颜色码与进度条回车覆盖**，不会出现 `[2m[36m` 这类乱码 |
 | 活动实时输出 | 页面底部常驻的**跨服务**全局控制台：把所有服务的启停系统事件与 stdout/stderr 汇成一条实时时间线，支持按来源/流筛选、关键字高亮、暂停、复制、清空与拖拽调高；折叠时保留一条标题栏并显示未读行数与最新一行，展开状态与高度会记住 |
+| 视图切换 | 托管服务支持**卡片**与**紧凑列表**两种视图：紧凑模式按列展示状态 / 服务 / 路径 / PID / 运行时长 / CPU / 内存 / 端口 / 操作，行高约 36px，适合服务数量多时快速浏览；视图选择会记在本地 |
 | 异常处理 | 异常退出自动重启（指数退避，最多 5 次/分钟，可选）；管理端重启后能识别「进程还在但已脱离托管」的残留服务并一键终止 |
 | 外部运行监听 | 服务被外部启动 / 自行退出 / 自行停止都能被发现；识别到外部启动的进程可以**接管**（指标、端口、停止随即生效） |
 | 站点图标 | SVG favicon（蓝紫渐变 + 齿轮，与顶栏 logo 同一套视觉），标签页与高分屏都清晰，且不引入二进制产物 |
@@ -451,7 +452,7 @@ service-manager/
 │   │   └── favicon.svg         # 站点图标（SVG，与顶栏 logo 同一套视觉）
 │   └── src/
 │       ├── main.js  App.vue  store.js  api.js  format.js  styles.css
-│       └── components/  ServiceCard / ServiceDetail / LogPanel / ActivityPanel
+│       └── components/  ServiceCard / ServiceRow / ServiceDetail / LogPanel / ActivityPanel
 │                        AddServiceModal / Sparkline
 │                        ProcessPanel（进程检测器）/ PortConflictModal（端口冲突）
 ├── scripts/

@@ -1,6 +1,7 @@
 <script setup>
 import { computed, onMounted, onUnmounted, ref } from 'vue';
 import ServiceCard from './components/ServiceCard.vue';
+import ServiceRow from './components/ServiceRow.vue';
 import ServiceDetail from './components/ServiceDetail.vue';
 import AddServiceModal from './components/AddServiceModal.vue';
 import ProcessPanel from './components/ProcessPanel.vue';
@@ -23,6 +24,17 @@ const keyword = ref('');
 const busy = ref(false);
 const hostWarningOpen = ref(false);
 
+/** 托管服务列表视图：卡片（默认）或紧凑列表，选择会记在本地 */
+const LIST_MODE_KEY = 'sm.compactList';
+const compact = ref(false);
+
+function toggleCompact() {
+  compact.value = !compact.value;
+  try {
+    localStorage.setItem(LIST_MODE_KEY, compact.value ? '1' : '0');
+  } catch { /* 忽略隐私模式下的写入失败 */ }
+}
+
 const detailService = computed(() => state.services.find((s) => s.id === detailId.value) || null);
 const detailLogs = computed(() => (detailId.value ? state.logs[detailId.value] || [] : []));
 const panelOpen = computed(() => state.processPanel.open);
@@ -43,6 +55,9 @@ const host = computed(() => state.host || {});
 const activityPad = computed(() => (state.activityPanel.open ? state.activityPanel.height : 40));
 
 onMounted(() => {
+  try {
+    compact.value = localStorage.getItem(LIST_MODE_KEY) === '1';
+  } catch { /* 忽略损坏的本地存储 */ }
   initProcessPanel();
   initActivityPanel();
   connect();
@@ -178,6 +193,11 @@ async function afterCreated(svc) {
         <button class="btn" :disabled="busy || !state.services.length" @click="guard(actions.stopAll)">全部停止</button>
         <button class="btn ghost" :disabled="busy" @click="refreshAll">刷新</button>
         <button
+          class="btn ghost"
+          :title="compact ? '切换为卡片视图' : '切换为紧凑列表'"
+          @click="toggleCompact"
+        >{{ compact ? '▦ 卡片视图' : '▤ 紧凑列表' }}</button>
+        <button
           class="btn"
           :class="panelOpen ? 'primary' : ''"
           title="检测本机所有 node 进程，并标出属于已托管服务的那些"
@@ -212,6 +232,27 @@ async function afterCreated(svc) {
       <div v-else-if="!filtered.length" class="empty">
         <h2>没有匹配的服务</h2>
         <p>试试其它关键字，或点击「刷新」。</p>
+      </div>
+
+      <div v-else-if="compact" class="card svc-list">
+        <div class="svc-list-head">
+          <span />
+          <span>服务</span>
+          <span>路径</span>
+          <span class="num">PID</span>
+          <span class="num">运行时长</span>
+          <span class="num">CPU</span>
+          <span class="num">内存</span>
+          <span>端口</span>
+          <span style="text-align: right">操作</span>
+        </div>
+        <ServiceRow
+          v-for="svc in filtered"
+          :key="svc.id"
+          :service="svc"
+          :busy="busy"
+          @open="openDetail"
+        />
       </div>
 
       <div v-else class="grid">

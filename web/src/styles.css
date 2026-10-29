@@ -167,6 +167,48 @@ a { color: var(--accent); }
   gap: 16px;
 }
 
+/* ---------- 紧凑列表视图 ---------- */
+
+.svc-list {
+  --svc-cols: 16px minmax(170px, 2fr) minmax(150px, 1.6fr) 56px 74px 54px 78px minmax(96px, 1fr) 208px;
+  padding: 0;
+  overflow-x: auto;
+}
+.svc-list-head,
+.svc-row {
+  display: grid;
+  grid-template-columns: var(--svc-cols);
+  align-items: center;
+  gap: 10px;
+  min-width: 1010px;
+  padding: 0 14px;
+}
+.svc-list-head {
+  height: 30px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-soft);
+  color: var(--muted);
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: .02em;
+}
+.svc-list-head .num { text-align: right; }
+.svc-row { min-height: 36px; border-bottom: 1px solid var(--border-soft); font-size: 12px; }
+.svc-row:last-child { border-bottom: 0; }
+.svc-row:hover { background: rgba(255, 255, 255, .03); }
+.svc-row .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.svc-row-name { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.svc-row-name .name { min-width: 0; font-size: 12.5px; font-weight: 650; }
+.svc-row-name .tag { height: 18px; padding: 0 6px; font-size: 10.5px; flex: none; }
+.svc-row-path { font-size: 11px; color: var(--muted); }
+.svc-row-ports {
+  display: flex; align-items: center; gap: 4px; min-width: 0;
+  flex-wrap: nowrap; overflow: hidden;
+}
+.svc-row-ports .tag { height: 18px; padding: 0 6px; font-size: 10.5px; flex: none; }
+.svc-row-actions { display: flex; align-items: center; justify-content: flex-end; gap: 5px; }
+.svc-row-actions .btn { white-space: nowrap; }
+
 .empty {
   text-align: center; padding: 64px 24px; color: var(--text-dim);
   border: 1px dashed var(--border); border-radius: var(--radius);
@@ -424,11 +466,21 @@ mark { background: rgba(239, 176, 63, 0.34); color: #ffe6b3; border-radius: 2px;
 .activity-tools .grow { flex: 1; }
 .activity-view {
   flex: 1; min-height: 0; overflow: auto;
-  background: #090c11; padding: 6px 0;
-  font-family: var(--mono); font-size: 12.3px; line-height: 1.6;
+  background: #090c11; padding: 4px 0;
+  font-family: var(--mono); font-size: 11.5px; line-height: 1.48;
+}
+.activity-view .log-line {
+  gap: 8px; padding: 0 12px; align-items: flex-start;
+}
+.activity-view .log-line .ts {
+  flex: none; width: 58px;
+  font-size: 11px; font-variant-numeric: tabular-nums;
 }
 .activity-view .log-line .svc {
-  flex: none; width: 130px; font-size: 11.5px; font-weight: 600; color: var(--purple);
+  flex: none; width: 118px; font-size: 11px; font-weight: 600; color: var(--purple);
+}
+.activity-view .log-line .stream {
+  flex: none; width: 30px; font-size: 10.5px; padding-top: 0;
 }
 .activity-empty { padding: 22px 16px; text-align: center; color: var(--muted); font-size: 12.5px; }
 
@@ -485,6 +537,15 @@ table.plain td.num { text-align: right; font-variant-numeric: tabular-nums; font
 }
 .toast.err { border-color: rgba(240,97,107,.45); color: #f79aa0; }
 .toast.ok { border-color: rgba(55,201,138,.45); color: #7ee2b8; }
+
+@media (max-width: 900px) {
+  .svc-list {
+    --svc-cols: 16px minmax(160px, 2fr) 52px 66px 50px 70px minmax(80px, 1fr) 208px;
+  }
+  .svc-list-head > :nth-child(3),
+  .svc-row .svc-row-path { display: none; }
+  .svc-list-head, .svc-row { min-width: 800px; }
+}
 
 @media (max-width: 760px) {
   .grid { grid-template-columns: 1fr; }
