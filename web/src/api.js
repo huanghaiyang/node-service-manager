@@ -74,6 +74,8 @@ export const api = {
 
   logs: (id, limit = 800) => request(`/api/services/${id}/logs`, { query: { limit } }),
   clearLogs: (id) => request(`/api/services/${id}/logs`, { method: 'DELETE' }),
+  /** 底部活动面板回填：聚合所有服务的近期日志 */
+  activity: (limit = 400) => request('/api/activity', { query: { limit } }),
 
   roots: () => request('/api/fs/roots'),
   listDir: (path) => request('/api/fs/list', { query: { path } }),

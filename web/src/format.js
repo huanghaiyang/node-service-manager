@@ -42,6 +42,29 @@ export function formatTimeOnly(iso) {
   return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
 
+/**
+ * 把文本按关键字切成高亮片段（单服务日志与底部活动面板共用）。
+ * 始终返回 [{ t, hit }] 形状，模板无需再判断空值。
+ */
+export function highlightParts(text, keyword) {
+  const raw = String(text ?? '');
+  const kw = String(keyword ?? '').trim();
+  if (!kw) return [{ t: raw, hit: false }];
+  const parts = [];
+  const lower = raw.toLowerCase();
+  const target = kw.toLowerCase();
+  let i = 0;
+  let idx = lower.indexOf(target, i);
+  while (idx !== -1) {
+    if (idx > i) parts.push({ t: raw.slice(i, idx), hit: false });
+    parts.push({ t: raw.slice(idx, idx + kw.length), hit: true });
+    i = idx + kw.length;
+    idx = lower.indexOf(target, i);
+  }
+  if (i < raw.length) parts.push({ t: raw.slice(i), hit: false });
+  return parts;
+}
+
 export function shortenPath(p, max = 52) {
   if (!p) return '';
   if (p.length <= max) return p;

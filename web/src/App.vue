@@ -4,13 +4,16 @@ import ServiceCard from './components/ServiceCard.vue';
 import ServiceDetail from './components/ServiceDetail.vue';
 import AddServiceModal from './components/AddServiceModal.vue';
 import ProcessPanel from './components/ProcessPanel.vue';
+import ActivityPanel from './components/ActivityPanel.vue';
 import PortConflictModal from './components/PortConflictModal.vue';
 import BatchConflictModal from './components/BatchConflictModal.vue';
 import SettingsModal from './components/SettingsModal.vue';
 import {
   state, runningCount, totals, connect, disconnect, refresh, actions, toast,
   initProcessPanel, persistProcessPanel, loadNodeProcesses,
-} from './store.js';import { api } from './api.js';
+  initActivityPanel, loadActivity,
+} from './store.js';
+import { api } from './api.js';
 import { formatBytes, formatPercent } from './format.js';
 
 const showAdd = ref(false);
@@ -36,10 +39,15 @@ const filtered = computed(() => {
 
 const host = computed(() => state.host || {});
 
+/** 底部活动面板占据的高度：展开时按用户拖拽的高度，收起时只留一条标题栏 */
+const activityPad = computed(() => (state.activityPanel.open ? state.activityPanel.height : 40));
+
 onMounted(() => {
   initProcessPanel();
+  initActivityPanel();
   connect();
   refresh();
+  loadActivity();
   if (state.processPanel.open) loadNodeProcesses({ refresh: true });
 });
 onUnmounted(disconnect);
@@ -98,7 +106,7 @@ async function afterCreated(svc) {
 </script>
 
 <template>
-  <div class="app">
+  <div class="app" :style="{ paddingBottom: `${activityPad}px` }">
     <!-- 顶栏 -->
     <header class="topbar">
       <div class="brand">
@@ -246,6 +254,8 @@ async function afterCreated(svc) {
       @close="state.batchConflicts = []"
       @fix="openPortConflictFromBatch"
     />
+
+    <ActivityPanel />
 
     <div class="toast-host">
       <div v-for="t in state.toasts" :key="t.id" class="toast" :class="t.kind">{{ t.message }}</div>

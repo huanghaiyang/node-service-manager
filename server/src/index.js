@@ -1027,6 +1027,16 @@ app.delete('/api/services/:id/logs', wrap(async (req, res) => {
   res.json({ ok: true });
 }));
 
+/**
+ * 底部「活动实时输出」面板的回填接口：把全部服务内存缓冲里的近期日志
+ * 按时间聚合成一条全局时间线。SSE 会持续推送新行，这里只负责打开页面时
+ * 先把「刚发生过的事」补齐，避免面板一开始是空的。
+ */
+app.get('/api/activity', wrap(async (req, res) => {
+  const limit = Math.min(Math.max(Number(req.query.limit) || 300, 1), 2000);
+  res.json({ ok: true, lines: logs.recent(limit) });
+}));
+
 /* ---- package.json 定位 ---- */
 
 app.get('/api/fs/roots', wrap(async (req, res) => {

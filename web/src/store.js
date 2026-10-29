@@ -27,6 +27,16 @@ export const state = reactive({
   portConflict: null,
   /** 批量启动时被端口冲突拦下的清单；非空即表示要展示冲突汇总 */
   batchConflicts: [],
+  /** 底部「活动实时输出」面板 */
+  activityPanel: {
+    open: true,
+    height: 280,
+    paused: false,
+  },
+  /** 跨服务的全局活动流（最近 MAX_ACTIVITY_LINES 行） */
+  activity: [],
+  /** 面板收起时新到的行数 */
+  activityUnread: 0,
 });
 
 let closeStream = null;
@@ -100,16 +110,115 @@ export function forgetLogs(id) {
   delete state.logs[id];
 }
 
+/* ---------------------------- 活动实时输出流 ------------------------------ */
+
+const MAX_ACTIVITY_LINES = 400;
+
+/**
+ * 统一活动行形状。key 只用于「服务端回填快照」与「SSE 实时行」的合并去重，
+ * 不参与界面展示；服务端快照与实时流可能包含同一行（打开页面瞬间的竞态）。
+ */
+function normalizeActivity(entry) {
+  const ts = entry?.ts || new Date().toISOString();
+  const serviceId = entry?.serviceId || null;
+  const stream = entry?.stream || 'system';
+  const text = String(entry?.text ?? '');
+  return {
+    key: `${serviceId || 'manager'}|${ts}|${stream}|${text}`,
+    serviceId,
+    ts,
+    stream,
+    text,
+  };
+}
+
+/** 追加一行实时活动；面板暂停时不入缓冲（恢复时用服务端快照补齐） */
+export function appendActivity(entry) {
+  if (!entry || state.activityPanel.paused) return;
+  const arr = state.activity;
+  arr.push(normalizeActivity(entry));
+  if (arr.length > MAX_ACTIVITY_LINES) arr.splice(0, arr.length - MAX_ACTIVITY_LINES);
+  if (!state.activityPanel.open) state.activityUnread += 1;
+}
+
+/**
+ * 合并服务端快照与实时流：
+ *  - 快照覆盖同一行的实时副本（按 key 计数一一抵消，避免重复）；
+ *  - 快照生成之后才到的实时行保留；
+ *  - 整体按时间升序重排，保证全局时间线不会因合并而错乱。
+ */
+function mergeActivity(snapshot) {
+  const remaining = new Map();
+  for (const line of snapshot) remaining.set(line.key, (remaining.get(line.key) || 0) + 1);
+  const extra = [];
+  for (const line of state.activity) {
+    const n = remaining.get(line.key) || 0;
+    if (n > 0) {
+      remaining.set(line.key, n - 1);
+      continue;
+    }
+    extra.push(line);
+  }
+  return [...snapshot, ...extra]
+    .sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0))
+    .slice(-MAX_ACTIVITY_LINES);
+}
+
+/** 拉取所有服务的近期日志作为活动面板的初始内容 */
+export async function loadActivity(limit = MAX_ACTIVITY_LINES) {
+  try {
+    const data = await api.activity(limit);
+    const snapshot = (data.lines || []).map(normalizeActivity);
+    state.activity = mergeActivity(snapshot);
+    state.activityUnread = 0;
+  } catch (err) {
+    toast(`活动输出载入失败：${err.message}`, 'err');
+  }
+}
+
+/** 只清空面板缓冲区，不动各服务落盘的日志文件 */
+export function clearActivity() {
+  state.activity = [];
+  state.activityUnread = 0;
+}
+
+const ACTIVITY_STORAGE_KEY = 'sm.activityPanel';
+
+export function initActivityPanel() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(ACTIVITY_STORAGE_KEY) || '{}');
+    if (typeof saved.open === 'boolean') state.activityPanel.open = saved.open;
+    const h = Number(saved.height);
+    if (Number.isFinite(h) && h >= 160 && h <= 900) state.activityPanel.height = h;
+  } catch { /* 忽略损坏的本地存储 */ }
+}
+
+export function persistActivityPanel() {
+  try {
+    localStorage.setItem(ACTIVITY_STORAGE_KEY, JSON.stringify({
+      open: state.activityPanel.open,
+      height: state.activityPanel.height,
+    }));
+  } catch { /* 忽略隐私模式下的写入失败 */ }
+}
+
 /* ------------------------------- 连接管理 -------------------------------- */
 
 export function connect() {
   if (closeStream) closeStream();
   closeStream = subscribe({
     open: () => {
+      const wasConnected = state.connected;
       state.connected = true;
       if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+      if (!wasConnected) {
+        appendActivity({ stream: 'system', text: '实时通道已连接，开始接收活动输出' });
+      }
     },
     error: () => {
+      if (state.connected) {
+        appendActivity({ stream: 'stderr', text: '实时通道断开，正在自动重连…' });
+      }
       state.connected = false;
     },
     snapshot: (payload) => {
@@ -122,7 +231,9 @@ export function connect() {
       state.loading = false;
     },
     log: (entry) => {
-      if (entry) appendLog(entry);
+      if (!entry) return;
+      appendLog(entry);
+      appendActivity(entry);
     },
     servicesChanged: () => {
       refresh();

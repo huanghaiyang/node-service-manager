@@ -22,6 +22,7 @@
 | 端口占用预检 | 启动前检查目标端口；被占用时弹窗显示**谁占用了它**（PID/进程名/是否另一个托管服务），并随机分配一个可用端口，也可手动填写。**「全部启动」会先做一遍同样的预检**，注定冲突的服务在启动前就被拦下并列出清单 |
 | Node 进程检测器 | 默认隐藏的侧边栏，一键展开后列出本机所有 node 进程（PID / 内存 / CPU / 各自监听的端口 / 命令行），并**标记出属于已托管服务的那些** |
 | 日志 | 子进程 stdout/stderr 落盘留存 + 内存环形缓冲，支持按流筛选、关键字搜索（高亮）、自动滚动、复制、清空；管理端重启后仍可回溯历史日志。**自动清洗 ANSI 颜色码与进度条回车覆盖**，不会出现 `[2m[36m` 这类乱码 |
+| 活动实时输出 | 页面底部常驻的**跨服务**全局控制台：把所有服务的启停系统事件与 stdout/stderr 汇成一条实时时间线，支持按来源/流筛选、关键字高亮、暂停、复制、清空与拖拽调高；折叠时保留一条标题栏并显示未读行数与最新一行，展开状态与高度会记住 |
 | 异常处理 | 异常退出自动重启（指数退避，最多 5 次/分钟，可选）；管理端重启后能识别「进程还在但已脱离托管」的残留服务并一键终止 |
 | 外部运行监听 | 服务被外部启动 / 自行退出 / 自行停止都能被发现；识别到外部启动的进程可以**接管**（指标、端口、停止随即生效） |
 | 站点图标 | SVG favicon（蓝紫渐变 + 齿轮，与顶栏 logo 同一套视觉），标签页与高分屏都清晰，且不引入二进制产物 |
@@ -359,6 +360,13 @@ Windows 上会额外生成一个 `wscript` 隐藏启动器（`.vbs` + `.cmd`）�
 `data/logs/<服务ID>.out.log` 与 `.err.log`（文件描述符 stdio，不走管道），
 管理端再以 250ms 轮询增量读取。因此管理端重启后历史日志仍在。
 
+**底部活动实时输出**：页面底部常驻一条跨服务的「全局控制台」，把每个服务的启停系统事件与
+stdout/stderr 按时间合并展示，而不只是当前打开的那一个服务。打开页面时会通过
+`GET /api/activity` 回填各服务内存缓冲里的近期日志（磁盘回填的原始输出行没有时间戳，
+不参与全局排序），之后由 SSE 的 `log` 事件持续追加。支持按服务来源 / 流筛选、关键字高亮、
+暂停（恢复时自动补齐缺口）、复制、清空、拖拽调整高度；清空只影响面板缓冲区，不会动磁盘日志。
+收起后只保留 40px 标题栏，并显示未读行数与最新一行。
+
 ---
 
 ## 设计要点
@@ -443,7 +451,7 @@ service-manager/
 │   │   └── favicon.svg         # 站点图标（SVG，与顶栏 logo 同一套视觉）
 │   └── src/
 │       ├── main.js  App.vue  store.js  api.js  format.js  styles.css
-│       └── components/  ServiceCard / ServiceDetail / LogPanel
+│       └── components/  ServiceCard / ServiceDetail / LogPanel / ActivityPanel
 │                        AddServiceModal / Sparkline
 │                        ProcessPanel（进程检测器）/ PortConflictModal（端口冲突）
 ├── scripts/
@@ -516,6 +524,7 @@ npx vite build    # 打包压缩产物到 dist/
 | GET | `/api/processes/node?refresh=1` | **Node 进程检测器**：全机 node 进程 + 端口 + 归属标记 |
 | GET | `/api/services/:id/logs?limit=500` | 读取日志（含磁盘字节数与落盘路径） |
 | DELETE | `/api/services/:id/logs` | 清空日志 |
+| GET | `/api/activity?limit=300` | **底部活动面板回填**：聚合所有服务内存缓冲的近期日志，跨服务按时间排序（最多 2000 条） |
 | POST | `/api/services/start-all` | 批量启动 |
 | POST | `/api/services/stop-all` | 批量停止 |
 

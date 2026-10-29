@@ -2,7 +2,7 @@
 import { computed, nextTick, ref, watch } from 'vue';
 import { api } from '../api.js';
 import { clearLogs, loadLogs, toast } from '../store.js';
-import { formatTimeOnly } from '../format.js';
+import { formatTimeOnly, highlightParts } from '../format.js';
 
 const props = defineProps({
   serviceId: { type: String, required: true },
@@ -51,26 +51,6 @@ function onScroll() {
   if (!el) return;
   const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
   autoScroll.value = atBottom;
-}
-
-function highlight(text) {
-  const raw = String(text ?? '');
-  const kw = keyword.value.trim();
-  // 无关键字时也必须返回同样形状的片段对象，否则模板取不到 .t 会渲染成空白
-  if (!kw) return [{ t: raw, hit: false }];
-  const parts = [];
-  const lower = raw.toLowerCase();
-  const target = kw.toLowerCase();
-  let i = 0;
-  let idx = lower.indexOf(target, i);
-  while (idx !== -1) {
-    if (idx > i) parts.push({ t: raw.slice(i, idx), hit: false });
-    parts.push({ t: raw.slice(idx, idx + kw.length), hit: true });
-    i = idx + kw.length;
-    idx = lower.indexOf(target, i);
-  }
-  if (i < raw.length) parts.push({ t: raw.slice(i), hit: false });
-  return parts;
 }
 
 async function doClear() {
@@ -138,7 +118,7 @@ async function doCopy() {
         <span class="ts">{{ formatTimeOnly(line.ts) }}</span>
         <span class="stream">{{ line.stream }}</span>
         <span class="text">
-          <template v-for="(part, j) in highlight(String(line.text))" :key="j">
+          <template v-for="(part, j) in highlightParts(line.text, keyword)" :key="j">
             <mark v-if="part.hit">{{ part.t }}</mark>
             <template v-else>{{ part.t }}</template>
           </template>

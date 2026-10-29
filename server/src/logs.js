@@ -226,6 +226,36 @@ export class LogStore {
     return { lines, bytes: { ...st.bytes }, total: st.buffer.length };
   }
 
+  /**
+   * 聚合所有服务的近期日志（底部「活动实时输出」面板的回填来源）。
+   *
+   * 每个服务的内存缓冲本来就在实时增长，这里不再读磁盘：
+   *  - 只取带时间戳的行。磁盘回填的 stdout/stderr 没有 ts（原始输出行不含时间），
+   *    混进全局时间线会让顺序完全错乱，因此直接跳过；
+   *  - 跨服务按 ts 升序排序后取最后 limit 条，观感与「一条真实的全局控制台」一致。
+   *
+   * @param {number} limit 最多返回多少行
+   * @returns {Array<{serviceId:string, ts:string, stream:string, text:string}>}
+   */
+  recent(limit = 300) {
+    const max = Math.max(0, Number(limit) || 0);
+    if (!max) return [];
+    const rows = [];
+    for (const st of this.state.values()) {
+      for (const line of st.buffer) {
+        if (!line.ts) continue;
+        rows.push({
+          serviceId: st.id,
+          ts: line.ts,
+          stream: line.stream,
+          text: line.text,
+        });
+      }
+    }
+    rows.sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
+    return rows.slice(-max);
+  }
+
   clear(id) {
     const st = this._state(id);
     st.buffer.length = 0;
