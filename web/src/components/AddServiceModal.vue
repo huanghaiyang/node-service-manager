@@ -34,6 +34,27 @@ const form = ref({
   env: '', entryUrl: '', autoRestart: false, autoStart: false,
 });
 const submitting = ref(false);
+const reloading = ref(false);
+
+/** 重新检测 package.json 的 script 列表（文件可能在浏览过程中被改过） */
+async function reloadPackageInfo() {
+  const path = packageInfo.value?.packageJsonPath;
+  if (!path) return;
+  reloading.value = true;
+  try {
+    const res = await api.analyze(path);
+    packageInfo.value = res.packageInfo;
+    const scripts = res.packageInfo?.scripts || [];
+    if (!scripts.some((s) => s.name === form.value.script)) {
+      form.value.script = res.packageInfo.recommendedScript || scripts[0]?.name || '';
+    }
+    toast(`已重新检测：${scripts.length} 个可用 script`, scripts.length ? 'ok' : 'err', scripts.length ? 3000 : 6000);
+  } catch (err) {
+    toast(`重新检测失败：${err.message}`, 'err', 6000);
+  } finally {
+    reloading.value = false;
+  }
+}
 
 const crumbs = computed(() => buildCrumbs(listing.value?.dir || '', separator.value));
 
@@ -350,7 +371,14 @@ async function submit() {
         </div>
 
         <div v-if="form.runtime === 'npm'" class="field" style="margin-bottom: 14px">
-          <label>选择 npm script（推荐项已标注）</label>
+          <div class="row" style="gap: 8px; align-items: center">
+            <label style="margin: 0">选择 npm script（推荐项已标注）</label>
+            <span class="grow" style="flex: 1" />
+            <span class="hint" style="margin: 0">{{ packageInfo?.scripts?.length || 0 }} 个可用</span>
+            <button class="btn ghost sm" :disabled="reloading" @click="reloadPackageInfo">
+              <span v-if="reloading" class="spin" /> 重新检测
+            </button>
+          </div>
           <div style="display: flex; flex-direction: column; gap: 6px; max-height: 210px; overflow: auto">
             <div
               v-for="s in packageInfo.scripts"

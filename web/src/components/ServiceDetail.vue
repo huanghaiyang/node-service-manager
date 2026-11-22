@@ -37,6 +37,11 @@ const form = reactive({
 const planPreview = ref(null);
 const previewError = ref('');
 const previewing = ref(false);
+/** 重新检测 package.json 里的可用 script */
+const detectingScripts = ref(false);
+/** 下拉里没有的脚本（例如刚手写进去、还没重载）走手动输入 */
+const manualScriptMode = ref(false);
+const manualScript = ref('');
 
 const ports = computed(() => props.service.ports || []);
 const entry = computed(() => props.service.entry || { url: '', source: 'none', live: false });
@@ -54,6 +59,8 @@ function syncForm() {
   form.command = props.service.command || '';
   form.entryUrl = props.service.entryUrl || '';
   form.cwd = props.service.cwd || '';
+  manualScriptMode.value = false;
+  manualScript.value = '';
   planPreview.value = null;
   previewError.value = '';
 }
@@ -74,20 +81,43 @@ function draftPayload() {
   };
 }
 
+/**
+ * 重新检测 package.json 里的可用 script。
+ * package.json 可能在纳管之后被改过（新增/改名 script），所以不能只在打开抽屉时读一次。
+ */
+async function detectScripts({ silent = false } = {}) {
+  detectingScripts.value = true;
+  try {
+    const res = await api.analyze(props.service.packageJsonPath);
+    pkgInfo.value = res.packageInfo;
+    pkgError.value = '';
+    syncScriptMode();
+    if (!silent) {
+      const count = res.packageInfo?.scripts?.length || 0;
+      toast(`已重新检测：${count} 个可用 script`, count ? 'ok' : 'err', count ? 3000 : 6000);
+    }
+  } catch (err) {
+    pkgInfo.value = null;
+    pkgError.value = err.message;
+    if (!silent) toast(`重新检测失败：${err.message}`, 'err', 6000);
+  } finally {
+    detectingScripts.value = false;
+  }
+}
+
 onMounted(async () => {
   syncForm();
   // 打开抽屉即回填磁盘上的历史日志（SSE 只能拿到连接之后的增量）
   await loadLogs(props.service.id, 800);
-  try {
-    const res = await api.analyze(props.service.packageJsonPath);
-    pkgInfo.value = res.packageInfo;
-  } catch (err) {
-    pkgError.value = err.message;
-  }
+  await detectScripts({ silent: true });
 });
 
 // 快照每 3s 会换成新对象；只在切换服务时回填，避免把用户正在编辑的表单冲掉
-watch(() => props.service?.id, (id) => { if (id) syncForm(); });
+watch(() => props.service?.id, async (id) => {
+  if (!id) return;
+  syncForm();
+  await detectScripts({ silent: true });
+});
 
 watch(tab, (next) => {
   if (next === 'logs') void loadLogs(props.service.id, 800);
@@ -151,6 +181,47 @@ const scriptKnown = computed(() => {
   if (!name) return false;
   return (pkgInfo.value?.scripts || []).some((s) => s.name === name);
 });
+
+/** package.json 里可选的 script 名称（给下拉用） */
+const scriptNames = computed(() => (pkgInfo.value?.scripts || []).map((s) => s.name));
+
+/**
+ * 决定 script 用「下拉」还是「手动输入」：
+ * - 当前脚本在 package.json 里 → 下拉选中它
+ * - 不在（刚改过 package.json、或当前配置本来就是个自定义名字）→ 手动输入并提示
+ */
+function syncScriptMode() {
+  const name = form.script.trim();
+  if (!name) {
+    manualScriptMode.value = false;
+    manualScript.value = '';
+    return;
+  }
+  if (scriptNames.value.includes(name)) {
+    manualScriptMode.value = false;
+    manualScript.value = '';
+  } else {
+    manualScriptMode.value = true;
+    manualScript.value = name;
+  }
+}
+
+watch(scriptNames, () => syncScriptMode());
+
+watch(manualScript, (value) => {
+  if (manualScriptMode.value) form.script = value.trim();
+});
+
+function useManualScript() {
+  manualScriptMode.value = true;
+  manualScript.value = form.script;
+}
+
+function useScriptDropdown() {
+  manualScriptMode.value = false;
+  const first = scriptNames.value[0];
+  if (!form.script.trim() && first) form.script = first;
+}
 
 async function guard(fn) {
   busy.value = true;
@@ -409,15 +480,40 @@ const version = computed(() => pkgInfo.value?.version || '');
           </div>
 
           <div v-if="form.runtime === 'npm'" class="field" style="margin-bottom: 12px">
-            <label>npm script（可直接输入脚本名）</label>
-            <input v-model="form.script" class="input mono" list="svc-script-options" placeholder="例如 dev" />
-            <datalist id="svc-script-options">
-              <option v-for="s in (pkgInfo?.scripts || [])" :key="s.name" :value="s.name">{{ s.command }}</option>
-            </datalist>
+            <div class="row" style="gap: 8px; align-items: center">
+              <label style="margin: 0">npm script</label>
+              <span class="grow" style="flex: 1" />
+              <span v-if="pkgInfo" class="hint" style="margin: 0">{{ pkgInfo.scripts?.length || 0 }} 个可用</span>
+              <button class="btn ghost sm" :disabled="detectingScripts" @click="detectScripts()">
+                <span v-if="detectingScripts" class="spin" /> 重新检测
+              </button>
+            </div>
+
+            <div class="row" style="gap: 8px; margin-top: 6px">
+              <select v-if="!manualScriptMode" v-model="form.script" class="select mono grow">
+                <option value="" disabled>选择 package.json 中的 script</option>
+                <option v-for="s in (pkgInfo?.scripts || [])" :key="s.name" :value="s.name">
+                  {{ s.name }}{{ s.recommended ? '（推荐）' : '' }} — {{ s.command }}
+                </option>
+                <option v-if="form.script && !scriptKnown" :value="form.script">
+                  {{ form.script }}（不在 package.json 中）
+                </option>
+              </select>
+              <input
+                v-else
+                v-model="manualScript"
+                class="input mono grow"
+                placeholder="手动输入脚本名，例如 dev"
+              />
+              <button class="btn ghost sm" v-if="!manualScriptMode" @click="useManualScript()">手动输入</button>
+              <button class="btn ghost sm" v-else @click="useScriptDropdown()">改用下拉</button>
+            </div>
+
             <span v-if="form.script && !scriptKnown" class="hint" style="color: #f0b35e">
-              package.json 里没有名为「{{ form.script }}」的 script，保存时会校验失败。
+              package.json 里没有名为「{{ form.script }}」的 script，保存时会校验失败；改过 package.json 的话先点「重新检测」。
             </span>
-            <span v-else class="hint">从 package.json 中选择，或直接输入脚本名（新加的 script 也能用）。</span>
+            <span v-else-if="manualScriptMode" class="hint">手动输入用于 package.json 里没有、但确实需要执行的脚本名；保存时后端仍会校验该 script 是否存在。</span>
+            <span v-else class="hint">脚本列表来自 package.json；新增或改名后点「重新检测」刷新。</span>
           </div>
           <div v-else-if="form.runtime === 'custom'" class="field" style="margin-bottom: 12px">
             <label>自定义命令</label>
