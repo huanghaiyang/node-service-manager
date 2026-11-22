@@ -14,6 +14,32 @@ export function normPath(p) {
   return String(p || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
 }
 
+/**
+ * 在已归一化的命令行里查找某个项目路径，要求「路径边界」匹配。
+ *
+ * 只做 includes 会误判同前缀的兄弟目录：`d:/sgames/gaea-rea` 会命中
+ * `d:/sgames/gaea-rea-tools/...`。所以命中后还要看下一个字符是不是分隔符或结束。
+ */
+export function containsRoot(hay, needle) {
+  if (!hay || !needle) return false;
+  const boundary = new Set(['/', '"', "'", ' ', '\t', '\n', '\r', ';', ',', ')', ']', '}']);
+  let i = hay.indexOf(needle);
+  while (i !== -1) {
+    const next = hay[i + needle.length];
+    if (next === undefined || boundary.has(next)) return true;
+    i = hay.indexOf(needle, i + 1);
+  }
+  return false;
+}
+
+/** 命令行是否引用了该项目（不判断是否由项目启动，只判断引用） */
+export function referencesProject(commandLine, roots, packageJsonPath = '') {
+  const hay = normPath(commandLine);
+  if (!hay) return false;
+  const needles = [...(roots || []), packageJsonPath].map(normPath).filter(Boolean);
+  return needles.some((needle) => containsRoot(hay, needle));
+}
+
 /** 从 ppid 链推算深度（越浅越可能是进程树根） */
 export function depthOf(pid, ppidOf) {
   let depth = 0;
@@ -61,24 +87,34 @@ export function subtreeOf(pid, ppidOf) {
  * 能佐证的信号：
  *   a) 树里有进程引用 <root>/node_modules/ —— npm/pnpm 拉起项目脚本时的典型形态
  *   b) 树里有进程引用服务的 package.json
- *   c) 服务声明了端口，且树里有进程在监听它
+ *   c) 服务已知端口（配置的 / 上次实际监听过的 / 崩溃时撞到的）里，
+ *      树中有进程正在监听 —— 同一个服务常常同时监听多个端口，
+ *      所以这里判断的是**端口集合**，而不是单个声明端口。
  *
  * @returns {'node_modules'|'package.json'|'port'|null} 佐证方式；null 表示不能佐证
  */
-export function corroboratesLaunch({ pid, ppidOf, cmdOf, portsOfPid, roots, packageJsonPath, declaredPort }) {
+export function corroboratesLaunch({
+  pid, ppidOf, cmdOf, portsOfPid, roots, packageJsonPath, declaredPort, declaredPorts,
+}) {
   const tree = subtreeOf(pid, ppidOf);
   const needles = [...(roots || []), packageJsonPath].filter(Boolean).map(normPath);
+  const wantedPorts = new Set(
+    [...(Array.isArray(declaredPorts) ? declaredPorts : []), declaredPort]
+      .map(Number)
+      .filter((p) => Number.isInteger(p) && p > 0 && p <= 65535),
+  );
   for (const cur of tree) {
     const cmd = normPath(cmdOf.get(cur));
     if (cmd) {
       for (const needle of needles) {
-        if (needle && cmd.includes(`${needle}/node_modules/`)) return 'node_modules';
-        if (needle && cmd.includes(needle) && needle.endsWith('package.json')) return 'package.json';
+        if (!needle) continue;
+        if (cmd.includes(`${needle}/node_modules/`)) return 'node_modules';
+        if (needle.endsWith('package.json') && containsRoot(cmd, needle)) return 'package.json';
       }
     }
-    if (declaredPort) {
+    if (wantedPorts.size) {
       const ports = portsOfPid(cur) || [];
-      if (ports.some((p) => p.port === declaredPort)) return 'port';
+      if (ports.some((p) => wantedPorts.has(Number(p.port)))) return 'port';
     }
   }
   return null;
@@ -88,6 +124,74 @@ export function corroboratesLaunch({ pid, ppidOf, cmdOf, portsOfPid, roots, pack
 export function isPmWrapper(cmd) {
   if (!cmd) return false;
   return /\b(npm-cli\.js|npx-cli\.js|pnpm\.c?js|yarn\.js|yarn\.cjs)\b/i.test(cmd);
+}
+
+/**
+ * 启动垫片：挂在 node 进程与终端之间的 shell，只负责把命令跑起来。
+ *
+ * Windows 下 `npm run dev` 的实际链条是：
+ *   node(npm-cli.js) → cmd.exe /d /s /c "vite" → node(vite)
+ * 中间的 cmd.exe 不是 node 进程，之前按「只在 node 父进程里上溯」的做法，
+ * 会把同一棵启动树拆成互不相干的两个实例 —— 多端口服务因此只认到其中一个。
+ */
+export function isShellShimName(name) {
+  const base = String(name || '').replace(/\.exe$/i, '').trim().toLowerCase();
+  return ['cmd', 'powershell', 'pwsh', 'sh', 'bash', 'dash', 'zsh', 'ksh', 'fish', 'busybox'].includes(base);
+}
+
+/**
+ * 找到「这一组外部实例的启动根」。
+ *
+ * 从命中的 node 进程向上爬，只穿过：
+ *   - 包管理器包装进程（npm / pnpm / yarn / npx 的 node 进程）
+ *   - 命令行引用了本项目的 node 进程（concurrently / vite 之类）
+ *   - 启动垫片（cmd.exe、sh -c 等非 node 进程）
+ * 遇到交互式终端、IDE 等就停下。
+ *
+ * 返回的根 pid 的整棵子树（含跨垫片的兄弟进程）才是这个实例组；
+ * 用它做采样根，多个端口、多个子服务才能一起被看见。
+ */
+export function launchGroupRoot({ pid, ppidOf, nameOf, cmdOf, roots, packageJsonPath }) {
+  let best = pid;
+  let cur = pid;
+  for (let i = 0; i < 24; i += 1) {
+    const parent = ppidOf.get(cur);
+    if (!parent || parent <= 0 || parent === cur) break;
+    if (cmdOf && cmdOf.has(parent)) {
+      const parentCmd = cmdOf.get(parent);
+      if (isPmWrapper(parentCmd) || referencesProject(parentCmd, roots, packageJsonPath)) {
+        best = parent;
+        cur = parent;
+        continue;
+      }
+      break;
+    }
+    if (isShellShimName(nameOf ? nameOf(parent) : '')) {
+      // 只穿过去，不把垫片本身当根（它没有可采样的 node 语义）
+      cur = parent;
+      continue;
+    }
+    break;
+  }
+  return best;
+}
+
+/**
+ * 汇总一个服务「已知的端口」：配置声明 + 上次实际探测到的 + 崩溃时撞到的 + 本次注入的。
+ *
+ * 这是多端口修复的关键之一：绝大多数服务并没有配置 port（端口写在代码或 .env 里），
+ * 旧逻辑只拿单个声明端口做判断，于是端口信号永远为空。
+ */
+export function collectKnownPorts(...sources) {
+  const out = new Set();
+  for (const source of sources) {
+    const list = Array.isArray(source) ? source : [source];
+    for (const value of list) {
+      const port = Number(value);
+      if (Number.isInteger(port) && port > 0 && port <= 65535) out.add(port);
+    }
+  }
+  return [...out].sort((a, b) => a - b);
 }
 
 /** 从候选 pid 向上找到最顶层的包管理器包装进程，作为接管目标 */

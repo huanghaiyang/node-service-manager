@@ -39,6 +39,13 @@ const ports = computed(() => props.service.ports || []);
 const entry = computed(() => props.service.entry || { url: '', source: 'none', live: false });
 const entryMeta = computed(() => ENTRY_SOURCE_META[entry.value.source] || ENTRY_SOURCE_META.none);
 const hasEntry = computed(() => Boolean(entry.value.url));
+
+/** 终止「同一服务的额外外部实例」（多端口启动的典型形态） */
+async function killExtras() {
+  for (const inst of st.value.extraInstances || []) {
+    await actions.killExtra(props.service, inst.pid);
+  }
+}
 </script>
 
 <template>
@@ -159,6 +166,16 @@ const hasEntry = computed(() => Boolean(entry.value.url));
         若确认它属于该服务，可接管。
       </span>
       <button class="btn sm" :disabled="busy" title="把该 PID 纳入托管，指标/端口/停止随即生效" @click="actions.adopt(service)">接管</button>
+    </div>
+    <div v-else-if="st.extraInstances?.length" class="banner warn">
+      <span>⚠</span>
+      <span class="grow">
+        该服务已托管运行，同时检测到 <b>{{ st.extraInstances.length }}</b> 个外部实例（同一服务多端口启动）：
+        <template v-for="(inst, i) in st.extraInstances" :key="inst.pid">
+          <span class="mono">PID {{ inst.pid }}</span><template v-if="inst.ports?.length">（端口 {{ inst.ports.join(', ') }}）</template><template v-if="i < st.extraInstances.length - 1">、</template>
+        </template>
+      </span>
+      <button class="btn danger sm" :disabled="busy" @click="killExtras">全部终止</button>
     </div>
     <div v-else-if="st.lastError" class="banner warn">
       <span>⚠</span><span class="grow">{{ st.lastError }}</span>

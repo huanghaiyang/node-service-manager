@@ -10,7 +10,10 @@ import { LogStore } from './logs.js';
 import { ProcessManager, STATUS, buildLaunchPlan } from './pm.js';
 import { ProcessSampler } from './metrics.js';
 import { PortScanner, defaultEntryUrl } from './ports.js';
-import { depthOf, candidateRank, corroboratesLaunch, topmostWrapper, cmdLabel } from './external.js';
+import {
+  depthOf, candidateRank, corroboratesLaunch, cmdLabel,
+  launchGroupRoot, referencesProject, normPath, collectKnownPorts, subtreeOf,
+} from './external.js';
 import { getAutostartStatus, setAutostart } from './autostart.js';
 import {
   getTrayStatus, startTray, stopTray, disposeTray, isTraySupported,
@@ -19,7 +22,7 @@ import { readSettings, patchSettings } from './settings.js';
 import {
   analyzePackage, listDirectory, listDriveRoots, scanForPackages, PackageJsonError,
 } from './packageScanner.js';
-import { displayName, formatBytes, sleep, cleanupTmpDir } from './util.js';
+import { displayName, formatBytes, sleep, cleanupTmpDir, isAlive } from './util.js';
 
 const DIST_DIR = path.resolve(fileURLToPath(new URL('../../dist', import.meta.url)));
 
@@ -162,10 +165,11 @@ async function sampleOnce() {
   try {
     const roots = [];
     for (const svc of store.list()) {
-      const st = pm.stateOf(svc.id);
-      if (st.pid) roots.push({ id: svc.id, pid: st.pid });
+      // 实例组：本端托管的根进程，或外部启动识别出的多个启动根（多端口/多实例）
+      const pids = pm.instancePids(svc.id);
+      if (pids.length) roots.push({ id: svc.id, pids });
     }
-    const snapshot = await sampler.sample(roots.map((r) => r.pid));
+    const snapshot = await sampler.sample(roots.flatMap((r) => r.pids));
     const ts = snapshot.ts;
 
     // 监听端口：比指标采样慢一档刷新；一次刷新覆盖所有服务
@@ -174,10 +178,10 @@ async function sampleOnce() {
       await portScanner.refresh().catch(() => { /* 探测失败就沿用上一轮结果 */ });
     }
 
-    for (const { id, pid } of roots) {
-      const agg = sampler.aggregate(snapshot, pid);
+    for (const { id, pids } of roots) {
+      const agg = sampler.aggregateMany(snapshot, pids);
       agg.sampledAt = new Date(ts).toISOString();
-      // 端口按「该服务实际归属的进程集合」取（进程树支持时含子进程）
+      // 端口按「该服务实际归属的进程集合」取（进程树支持时含子进程，多实例时含全部实例组）
       agg.ports = portScanner.pick(agg.processes.map((p) => p.pid));
       // 再逐个进程标出它自己监听的端口：monorepo 里一眼看出哪个子进程起了、占哪个端口
       for (const proc of agg.processes) {
@@ -186,6 +190,14 @@ async function sampleOnce() {
       }
       lastMetrics.set(id, agg);
       pushHistory(id, { ts, ...agg });
+
+      // 记住实际监听过的端口：很多服务不配置 port，外部启动探测只能靠这份记录
+      const tcpPorts = [...new Set(agg.ports.filter((p) => p.proto === 'tcp').map((p) => p.port))].slice(0, 12);
+      const svcNow = store.get(id);
+      const prevPorts = svcNow?.lastPorts || [];
+      if (svcNow && (tcpPorts.length !== prevPorts.length || tcpPorts.some((p, i) => p !== prevPorts[i]))) {
+        store.update(id, { lastPorts: tcpPorts });
+      }
     }
     for (const svc of store.list()) {
       if (!roots.some((r) => r.id === svc.id)) {
@@ -225,11 +237,12 @@ let sampleTimer = null;
 
 /* --------------------------- Node 进程检测器 ------------------------------ */
 
-/** 该 pid 是否属于某个已托管服务（根进程或进程树成员） */
+/** 该 pid 是否属于某个已托管服务（实例组根或进程树成员） */
 function managedMatchFor(pid) {
   for (const svc of store.list()) {
     const st = pm.stateOf(svc.id);
     if (st.pid === pid) return { serviceId: svc.id, serviceName: svc.name, matchedBy: 'pid', role: 'root' };
+    if (st.pids?.includes(pid)) return { serviceId: svc.id, serviceName: svc.name, matchedBy: 'pid', role: 'root' };
   }
   for (const svc of store.list()) {
     const members = lastMetrics.get(svc.id)?.processes;
@@ -240,26 +253,22 @@ function managedMatchFor(pid) {
   return null;
 }
 
-/** 服务根目录（归一化），用于按命令行/工作目录反查归属 */
-function managedRoots() {
-  const norm = (p) => String(p || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
-  return store.list().map((svc) => ({
-    id: svc.id,
-    name: svc.name,
-    roots: [norm(svc.cwd), norm(svc.root)].filter(Boolean),
-  }));
-}
-
 /** 从命令行里找出它属于哪个托管服务（用于识别不是我们直接拉起的子进程） */
 function matchByCommandLine(commandLine) {
   if (!commandLine) return null;
-  const hay = String(commandLine).replace(/\\/g, '/').toLowerCase();
   let best = null;
-  for (const svc of managedRoots()) {
-    for (const root of svc.roots) {
-      if (root && hay.includes(root) && (!best || root.length > best.len)) {
-        best = { serviceId: svc.id, serviceName: svc.name, matchedBy: 'commandline', role: 'related', len: root.length };
-      }
+  for (const svc of store.list()) {
+    const roots = [svc.cwd, svc.root].filter(Boolean);
+    if (!referencesProject(commandLine, roots)) continue;
+    const len = Math.max(0, ...roots.map((r) => normPath(r).length));
+    if (!best || len > best.len) {
+      best = {
+        serviceId: svc.id,
+        serviceName: svc.name,
+        matchedBy: 'commandline',
+        role: 'related',
+        len,
+      };
     }
   }
   if (!best) return null;
@@ -360,11 +369,19 @@ let lastExternalScanAt = 0;
  * 归属用两个信号，强信号优先：
  *   1. 命令行引用了该服务，**且能佐证是从该项目启动的**（见 corroboratesLaunch）
  *      —— 高置信，断言「外部运行中」
- *   2. 该服务声明的端口上，有不属于任何托管树的 node 进程在监听 —— 弱信号，只提示
+ *   2. 该服务**已知端口**上有不属于任何托管树的 node 进程在监听 —— 弱信号，只提示
  *
  * 为什么强信号也要求佐证：「命令行里出现项目目录」太宽松了。
  * 真实误判案例：`node D:\sgames\gaea-rea\gaea-mcp\server.mjs` 是一个 MCP 服务器，
  * 命令行确实包含项目目录，但它和该项目的 web 服务毫无关系，却被断言成「外部运行中」。
+ *
+ * **多实例 / 多端口**（曾经完全探测不到的场景）：
+ *   - 抽出「启动根」：顺着完整父子链上溯，穿过 npm 包装层与 cmd.exe/sh 启动垫片，
+ *     拿到这一组进程共同的根，而不是只认命中的那一个叶子进程；
+ *   - 一个服务可以有多组根：一个服务同时起前端(5173)+后端(8080) 就是一棵树两个端口，
+ *     手动起两份实例则可能是两棵树；
+ *   - 端口信号不再只看单个「声明端口」，而是配置 + 上次实际监听 + 崩溃端口的并集；
+ *   - 服务已经由本端托管时，也会继续扫描，把「同一服务的额外外部实例」挂到状态上。
  *
  * 同时本函数还负责**复核已有的外部声明**：外部进程可能已经变了性质或被 PID 复用，
  * 只要不再能佐证，就撤销这个声明（回落到「已停止」）。
@@ -374,47 +391,78 @@ async function detectExternalRuns({ force = false } = {}) {
   lastExternalScanAt = Date.now();
 
   const all = store.list();
-  // 需要探测（没在跑）的服务；以及需要复核（已被判为外部运行但未接管）的服务
+  // 没在跑 → 发现外部实例；已判为外部运行 → 复核 + 增量发现；本端在跑 → 只找额外实例
   const targets = [];
   const toVerify = [];
+  const running = [];
   for (const svc of all) {
     const st = pm.stateOf(svc.id);
     if (st.status === STATUS.ORPHANED && !st.adopted) toVerify.push({ svc, st });
-    if (!st.pid && ![STATUS.STARTING, STATUS.STOPPING, STATUS.RUNNING, STATUS.ORPHANED].includes(st.status)) {
-      targets.push(svc);
+    else if (st.pid) running.push({ svc, st });
+    else if (![STATUS.STARTING, STATUS.STOPPING, STATUS.RUNNING, STATUS.ORPHANED].includes(st.status)) {
+      targets.push({ svc, st });
     }
   }
-  if (!targets.length && !toVerify.length) return 0;
+  if (!targets.length && !toVerify.length && !running.length) return 0;
 
-  const listing = await sampler.listNodeProcesses({ ttlMs: 2500 });
-  // 注意：ppid / 命令行映射用**全量** node 进程构建 ——
-  // 复核已有声明时要能看到「该服务自己的进程树」，它会被下面的 free 过滤掉。
-  const ppidOf = new Map(listing.rows.map((r) => [r.pid, r.ppid || 0]));
-  const allPids = new Set(listing.rows.map((r) => r.pid));
-  // 候选/提示只考虑「不属于任何托管服务进程树」的进程
-  const free = listing.rows.filter((r) => r.pid !== process.pid && !managedMatchFor(r.pid));
-  const targetsById = new Map(targets.map((s) => [s.id, s]));
+  const listing = await sampler.listNodeProcesses({ force, ttlMs: force ? 0 : 8000 });
+  const nodeRows = listing.rows.filter((r) => r.pid !== process.pid);
+  const nodePids = new Set(nodeRows.map((r) => r.pid));
 
   let details = null;
   try {
-    details = await sampler.queryNodeProcessDetails({ ttlMs: 15000 });
+    details = await sampler.queryNodeProcessDetails({ force, ttlMs: force ? 0 : 8000 });
   } catch { details = null; }
   const cmdOf = new Map();
-  for (const row of listing.rows) {
+  for (const row of nodeRows) {
     const cmd = details?.get(row.pid)?.commandLine;
     if (cmd) cmdOf.set(row.pid, cmd);
   }
-  const portsOfPid = (pid) => portScanner.pick([pid]);
 
-  const freePids = new Set(free.map((r) => r.pid));
+  // 父子关系用**全量快照**：Windows 下 npm → cmd.exe → node 这条链里的 cmd.exe 不是 node，
+  // 只用 node 之间的父子关系会把同一棵启动树拆散，多端口服务就只认到其中一个进程。
+  const ppidOf = new Map();
+  const nameOfMap = new Map();
+  for (const [pid, row] of sampler.lastSnapshot?.processes || []) {
+    ppidOf.set(pid, row.ppid || 0);
+    nameOfMap.set(pid, row.name || '');
+  }
+  for (const row of nodeRows) {
+    if (!ppidOf.has(row.pid)) ppidOf.set(row.pid, row.ppid || 0);
+    if (!nameOfMap.has(row.pid)) nameOfMap.set(row.pid, row.name || 'node');
+  }
+  const nameOf = (pid) => nameOfMap.get(pid) || '';
+
+  // 归属表：这个 pid 目前属于哪个服务的实例组 / 进程树
+  const ownerOf = new Map();
+  for (const svc of all) {
+    const st = pm.stateOf(svc.id);
+    const rootPids = st.pids?.length ? st.pids : (st.pid ? [st.pid] : []);
+    for (const pid of rootPids) ownerOf.set(pid, svc.id);
+    for (const proc of lastMetrics.get(svc.id)?.processes || []) {
+      if (!ownerOf.has(proc.pid)) ownerOf.set(proc.pid, svc.id);
+    }
+  }
+
+  const portsOfPids = (pids) => portScanner.pick(pids).filter((p) => p.proto === 'tcp').map((p) => p.port);
+  const portsOfPid = (pid) => portScanner.pick([pid]);
+  const portsOfTree = (pid) => portsOfPids([...(subtreeOf(pid, ppidOf))]);
+  const freePids = new Set(nodeRows.filter((r) => !ownerOf.has(r.pid)).map((r) => r.pid));
+
   // 注意：常规采样只在「有服务在跑」时刷新端口表（roots.length 判断），
-  // 而外部运行探测恰恰只在「全部停止」时才有意义 —— 那时端口表可能是空的。
-  // 所以这里按需补刷一次，否则端口信号永远匹配不到。
+  // 而外部探测往往发生在「全部停止」时 —— 那时端口表可能是空的。
   if (freePids.size && Date.now() - (portScanner.sampledAt || 0) > 4000) {
     await portScanner.refresh().catch(() => {});
   }
 
-  /** 对某服务做一次佐证校验 */
+  const knownPortsOf = (svc, st) => collectKnownPorts(
+    svc.port,
+    svc.lastPorts,
+    st?.crashPort,
+    st?.effectivePort,
+    lastMetrics.get(svc.id)?.ports?.map((p) => p.port),
+  );
+
   const corroborate = (svc, st, pid) => corroboratesLaunch({
     pid,
     ppidOf,
@@ -422,83 +470,131 @@ async function detectExternalRuns({ force = false } = {}) {
     portsOfPid,
     roots: [svc.cwd, svc.root].filter(Boolean),
     packageJsonPath: svc.packageJsonPath,
-    declaredPort: svc.port || st.crashPort || null,
+    declaredPorts: knownPortsOf(svc, st),
   });
+
+  /**
+   * 在给定候选进程里找出该服务的全部「启动根」，以及只是碰到目录的弱信号。
+   * 每个根代表一组实例（一个根 → 一棵进程树 → 可能监听多个端口）。
+   */
+  const resolveLaunchRoots = (svc, st, rows) => {
+    const found = new Map();
+    const loose = [];
+    const svcRoots = [svc.cwd, svc.root].filter(Boolean);
+    for (const row of rows) {
+      // 进程枚举/命令行都是带缓存的，刚停止的实例可能还在缓存里；以进程是否存活为准
+      if (!isAlive(row.pid)) continue;
+      const cmd = cmdOf.get(row.pid);
+      if (!cmd) continue;
+      if (!referencesProject(cmd, svcRoots)) continue;
+      const rootPid = launchGroupRoot({
+        pid: row.pid, ppidOf, nameOf, cmdOf, roots: svcRoots, packageJsonPath: svc.packageJsonPath,
+      });
+      if (!isAlive(rootPid)) continue;
+      const why = corroborate(svc, st, rootPid);
+      if (!why) {
+        loose.push({ row, cmd });
+        continue;
+      }
+      const prev = found.get(rootPid);
+      found.set(rootPid, {
+        pid: rootPid,
+        why,
+        ports: [...new Set([...(prev?.ports || []), ...portsOfTree(rootPid)])],
+        detail: why === 'port'
+          ? '实例组里有进程监听该服务的已知端口'
+          : `命令行引用了该项目的 ${why === 'package.json' ? 'package.json' : 'node_modules'}，判定为由其脚本启动`,
+      });
+    }
+    return { found, loose };
+  };
+
+  const pickBestRoot = (roots) => {
+    let best = null;
+    for (const info of roots.values()) {
+      const cand = { pid: info.pid, confidence: 'high', depth: depthOf(info.pid, ppidOf) };
+      if (!best || candidateRank(cand) < candidateRank(best.cand)) best = { info, cand, rank: candidateRank(cand) };
+    }
+    return best ? best.info : null;
+  };
 
   let changed = 0;
 
-  // ---- 复核：已有的「外部运行中」是否仍然成立 ----
+  // ---- 复核：已有的「外部运行中」是否仍然成立，并顺带发现新增的实例根 ----
   for (const { svc, st } of toVerify) {
-    const pid = st.pid;
-    if (!pid) continue;
-    // 进程已消失 → 交给心跳巡检处理（会记为「外部进程已退出」）
-    if (!allPids.has(pid)) continue;
-    const why = corroborate(svc, st, pid);
-    if (!why) {
-      if (pm.clearExternal(svc.id, `PID=${pid} 不再能佐证属于本服务`)) changed += 1;
+    const knownRoots = st.pids?.length ? st.pids : (st.pid ? [st.pid] : []);
+    const candidates = nodeRows.filter((r) => !ownerOf.has(r.pid) || ownerOf.get(r.pid) === svc.id);
+    const { found } = resolveLaunchRoots(svc, st, candidates);
+    const roots = new Map(found);
+    for (const pid of knownRoots) {
+      if (!isAlive(pid)) continue;
+      const why = corroborate(svc, st, pid);
+      if (why) {
+        roots.set(pid, {
+          pid,
+          why,
+          ports: portsOfTree(pid),
+          detail: why === 'port'
+            ? '实例组里有进程监听该服务的已知端口'
+            : `命令行引用了该项目的 ${why === 'package.json' ? 'package.json' : 'node_modules'}`,
+        });
+      }
     }
-  }
-
-  if (!targets.length) return changed;
-
-  const claimed = new Map();
-  const consider = (serviceId, cand) => {
-    const prev = claimed.get(serviceId);
-    if (!prev || candidateRank(cand) < candidateRank(prev)) claimed.set(serviceId, cand);
-  };
-
-  // ---- 信号 1：命令行引用该服务，且能佐证是从该项目启动的 ----
-  const looseHints = new Map();
-  for (const row of free) {
-    const cmd = cmdOf.get(row.pid);
-    if (!cmd) continue;
-    const m = matchByCommandLine(cmd);
-    if (!m || !targetsById.has(m.serviceId)) continue;
-    const svc = targetsById.get(m.serviceId);
-    const st = pm.stateOf(svc.id);
-    const why = corroborate(svc, st, row.pid);
-    if (why) {
-      const target = topmostWrapper(row.pid, ppidOf, cmdOf);
-      consider(svc.id, {
-        pid: target,
-        matchedBy: 'commandline',
-        confidence: 'high',
-        detail: why === 'port'
-          ? `进程树里有进程监听该服务声明的端口`
-          : `命令行引用了该项目的 ${why === 'package.json' ? 'package.json' : 'node_modules'}，判定为由其脚本启动`,
-        startedAt: details?.get(target)?.startedAt || null,
-        depth: depthOf(target, ppidOf),
-      });
-    } else if (!looseHints.has(svc.id)) {
-      // 只是「碰了这个目录」，不代表服务在跑 → 降级为可疑提示
-      looseHints.set(svc.id, {
-        pid: row.pid,
-        confidence: 'low',
-        detail: `有进程在本项目目录下运行（PID ${row.pid}，${cmdLabel(cmd) || '未知命令'}），但不像该服务的启动命令`,
-        detectedAt: new Date().toISOString(),
-      });
+    if (!roots.size) {
+      if (pm.clearExternal(svc.id, `PID=${knownRoots.join(', ') || '—'} 不再能佐证属于本服务`)) changed += 1;
+      continue;
     }
+    const best = pickBestRoot(roots);
+    const groupPids = [...roots.keys()];
+    const detail = groupPids.length > 1
+      ? `${best.detail}（实例组共 ${groupPids.length} 个启动根${best.ports.length ? `，端口 ${best.ports.join(', ')}` : ''}）`
+      : best.detail;
+    if (pm.markExternal(svc.id, {
+      pid: best.pid,
+      pids: groupPids,
+      matchedBy: 'commandline',
+      detail,
+      startedAt: details?.get(best.pid)?.startedAt || st.startedAt || null,
+      confidence: 'high',
+    })) changed += 1;
   }
 
-  // ---- 信号 2：服务声明的端口上有非托管的 node 进程在监听（弱信号） ----
-  const portClaims = new Map();
-  for (const svc of targets) {
-    const st = pm.stateOf(svc.id);
-    const p = svc.port || st.crashPort || null;
-    if (!p) continue;
-    if (!portClaims.has(p)) portClaims.set(p, []);
-    portClaims.get(p).push(svc);
-  }
-  const hints = new Map();
-  for (const [port, svcs] of portClaims) {
-    if (svcs.length !== 1) continue; // 端口归属有歧义，宁可不动
-    const svc = svcs[0];
-    if (claimed.has(svc.id)) continue; // 已有强信号，不必再挂提示
-    const st = pm.stateOf(svc.id);
-    // 「崩溃」状态已经有更精确的端口冲突诊断，不再叠加可疑提示
-    if (st.status === STATUS.CRASHED) continue;
-    for (const occupant of portScanner.whoListensOn(port)) {
-      if (!freePids.has(occupant.pid)) continue;
+  // ---- 发现：没在跑的服务被外部启动 ----------------
+  if (targets.length) {
+    const claimed = new Map();
+    const looseHints = new Map();
+    const freeRows = nodeRows.filter((r) => !ownerOf.has(r.pid));
+    for (const { svc, st } of targets) {
+      const { found, loose } = resolveLaunchRoots(svc, st, freeRows);
+      if (found.size) claimed.set(svc.id, found);
+      if (loose.length && !looseHints.has(svc.id)) {
+        const { row, cmd } = loose[0];
+        looseHints.set(svc.id, {
+          pid: row.pid,
+          confidence: 'low',
+          detail: `有进程在本项目目录下运行（PID ${row.pid}，${cmdLabel(cmd) || '未知命令'}），但不像该服务的启动命令`,
+          detectedAt: new Date().toISOString(),
+        });
+      }
+    }
+
+    // ---- 弱信号：已知端口上有非托管的 node 进程在监听 ----
+    // 同一端口被多个服务声明时归属有歧义，宁可不动；一个服务可以有多个端口。
+    const portClaims = new Map();
+    for (const { svc, st } of targets) {
+      for (const port of knownPortsOf(svc, st)) {
+        if (!portClaims.has(port)) portClaims.set(port, []);
+        portClaims.get(port).push(svc);
+      }
+    }
+    const hints = new Map();
+    for (const [port, svcs] of portClaims) {
+      if (svcs.length !== 1) continue;
+      const svc = svcs[0];
+      if (claimed.has(svc.id)) continue; // 已有强信号，不必再挂提示
+      if (pm.stateOf(svc.id).status === STATUS.CRASHED) continue;
+      const occupant = portScanner.whoListensOn(port).find((o) => freePids.has(o.pid));
+      if (!occupant) continue;
       hints.set(svc.id, {
         pid: occupant.pid,
         port,
@@ -506,19 +602,50 @@ async function detectExternalRuns({ force = false } = {}) {
         detail: `端口 ${port} 上有非托管进程在监听`,
         detectedAt: new Date().toISOString(),
       });
-      break; // 一个服务只提示一个进程
+    }
+
+    // 强信号：断言「外部运行中」，整组实例一起纳入
+    for (const [serviceId, roots] of claimed) {
+      const best = pickBestRoot(roots);
+      const groupPids = [...roots.keys()];
+      const detail = groupPids.length > 1
+        ? `${best.detail}（实例组共 ${groupPids.length} 个启动根${best.ports.length ? `，端口 ${best.ports.join(', ')}` : ''}）`
+        : best.detail;
+      if (pm.markExternal(serviceId, {
+        pid: best.pid,
+        pids: groupPids,
+        matchedBy: 'commandline',
+        confidence: 'high',
+        detail,
+        startedAt: details?.get(best.pid)?.startedAt || null,
+      })) changed += 1;
+    }
+    // 弱信号：挂提示（端口优先于「只是碰了目录」），并清掉已经失效的旧提示
+    for (const { svc } of targets) {
+      const hint = hints.get(svc.id) || looseHints.get(svc.id) || null;
+      if (pm.setExternalHint(svc.id, hint)) changed += 1;
     }
   }
 
-  // 强信号：断言「外部运行中」
-  for (const [serviceId, cand] of claimed) {
-    if (pm.markExternal(serviceId, cand)) changed += 1;
+  // ---- 已托管运行中：查找「同一服务的额外外部实例」（多端口启动的另一种形态）----
+  for (const { svc, st } of running) {
+    const groupPids = new Set(st.pids?.length ? st.pids : (st.pid ? [st.pid] : []));
+    for (const proc of lastMetrics.get(svc.id)?.processes || []) groupPids.add(proc.pid);
+    const candidates = nodeRows.filter((r) => !groupPids.has(r.pid) && (!ownerOf.has(r.pid) || ownerOf.get(r.pid) === svc.id));
+    const { found } = resolveLaunchRoots(svc, st, candidates);
+    const extras = [];
+    for (const info of found.values()) {
+      if (groupPids.has(info.pid)) continue;
+      extras.push({
+        pid: info.pid,
+        ports: portsOfTree(info.pid),
+        detail: `${info.detail}（该服务已由本工具托管运行，这是另一个外部实例）`,
+        detectedAt: new Date().toISOString(),
+      });
+    }
+    if (pm.setExtraInstances(svc.id, extras)) changed += 1;
   }
-  // 弱信号：挂提示（端口优先于「只是碰了目录」），并清掉已经失效的旧提示
-  for (const svc of targets) {
-    const hint = hints.get(svc.id) || looseHints.get(svc.id) || null;
-    if (pm.setExternalHint(svc.id, hint)) changed += 1;
-  }
+
   return changed;
 }
 
@@ -719,20 +846,157 @@ app.get('/api/services/:id', wrap(async (req, res) => {
   res.json({ ok: true, service: serviceView(svc) });
 }));
 
+/** 从请求体里挑出可持久化的配置字段（PATCH 与「更换启动命令」共用） */
+function pickServicePatch(body = {}) {
+  const patch = {};
+  for (const key of ['name', 'script', 'runtime', 'command', 'args', 'env', 'cwd', 'autoRestart', 'description', 'entryUrl']) {
+    if (key in body) patch[key] = body[key];
+  }
+  if ('port' in body) patch.port = body.port;
+  return patch;
+}
+
+/**
+ * 校验一份「待保存」的服务配置能否真正解析出启动计划。
+ * 保存前就把问题暴露出来，避免出现「保存成功、下次启动才炸」。
+ */
+function validateLaunchConfig(candidate) {
+  if (!fs.existsSync(candidate.packageJsonPath)) {
+    throw Object.assign(new Error(`package.json 不存在：${candidate.packageJsonPath}`), { code: 'PACKAGE_MISSING' });
+  }
+  if (!fs.existsSync(candidate.cwd)) {
+    throw Object.assign(new Error(`工作目录不存在：${candidate.cwd}`), { code: 'CWD_MISSING' });
+  }
+  if (candidate.runtime === 'npm') {
+    let info = null;
+    try {
+      info = analyzePackage(candidate.packageJsonPath);
+    } catch (err) {
+      throw Object.assign(new Error(`package.json 解析失败：${err.message}`), { code: 'PACKAGE_INVALID' });
+    }
+    if (!info.scripts.some((s) => s.name === candidate.script)) {
+      throw Object.assign(
+        new Error(`package.json 里没有名为「${candidate.script || '(空)'}」的 script`),
+        { code: 'SCRIPT_NOT_FOUND' },
+      );
+    }
+  }
+  // 解析失败会抛 NO_SCRIPT / NO_ENTRY / NO_COMMAND / SCRIPT_NOT_FOUND
+  return buildLaunchPlan(candidate);
+}
+
 app.patch('/api/services/:id', wrap(async (req, res) => {
   const svc = requireService(req);
   const st = pm.stateOf(svc.id);
   if (st.status === STATUS.RUNNING || st.status === STATUS.STARTING) {
     throw Object.assign(new Error('请先停止服务再修改配置'), { code: 'BAD_REQUEST' });
   }
-  const patch = {};
-  for (const key of ['name', 'script', 'runtime', 'command', 'args', 'env', 'cwd', 'autoRestart', 'description', 'entryUrl']) {
-    if (key in req.body) patch[key] = req.body[key];
-  }
-  if ('port' in req.body) patch.port = req.body.port;
+  const patch = pickServicePatch(req.body);
   const updated = store.update(svc.id, patch);
   broadcast('services-changed', { action: 'update', id: svc.id });
   res.json({ ok: true, service: serviceView(updated) });
+}));
+
+/**
+ * 更换被托管服务的启动命令（npm script / node 入口 / 自定义命令 / 参数 / 工作目录）。
+ *
+ * 与 PATCH 的区别：
+ *   - 先拿候选配置解析一次启动计划，解析不出来（脚本不存在、入口找不到、命令为空）就直接 400，
+ *     不会出现「保存成功、下次启动才炸」；
+ *   - 服务正在运行时可带 `restart: true`，按「停 → 存 → 启」原子地完成更换；
+ *     不带 restart 仍按旧规则拒绝（避免误改运行中实例的配置）。
+ */
+app.post('/api/services/:id/launch-config', wrap(async (req, res) => {
+  const svc = requireService(req);
+  const st = pm.stateOf(svc.id);
+  const body = req.body || {};
+  const patch = pickServicePatch(body);
+  const candidate = { ...svc, ...patch };
+
+  // 解析失败会抛 PACKAGE_MISSING / CWD_MISSING / SCRIPT_NOT_FOUND / NO_SCRIPT / NO_ENTRY / NO_COMMAND
+  const newPlan = validateLaunchConfig(candidate);
+  let oldPlan = null;
+  try { oldPlan = buildLaunchPlan(svc); } catch { /* 旧配置本身可能已失效 */ }
+
+  if (st.status === STATUS.ORPHANED) {
+    throw Object.assign(
+      new Error('该服务正在外部运行，无法更换启动命令。请先「接管」或「终止」外部进程'),
+      { code: 'ORPHANED' },
+    );
+  }
+  if ([STATUS.STARTING, STATUS.STOPPING].includes(st.status)) {
+    throw Object.assign(
+      new Error('服务正在启动/停止中，请等待本次操作结束再更换启动命令'),
+      { code: 'BUSY' },
+    );
+  }
+  const running = [STATUS.RUNNING, STATUS.STARTING].includes(st.status);
+  if (running && body.restart !== true) {
+    throw Object.assign(
+      new Error('服务正在运行：勾选「保存并重启」即可按新命令重启，或先停止服务再保存'),
+      { code: 'ALREADY_RUNNING' },
+    );
+  }
+
+  if (running) {
+    await pm.stop(svc.id);
+    sampler.invalidateNodeCaches();
+    // 给监听套接字一点释放时间，避免新命令撞上旧端口的 EADDRINUSE
+    await sleep(300);
+  }
+
+  const updated = store.update(svc.id, patch);
+  const oldDisplay = oldPlan?.display || '（无）';
+  const newDisplay = newPlan.display;
+  logs.append(
+    svc.id,
+    running
+      ? `已更换启动命令（旧：${oldDisplay} → 新：${newDisplay}），即将按新命令重启`
+      : `已更换启动命令（旧：${oldDisplay} → 新：${newDisplay}）`,
+    'system',
+  );
+  broadcast('services-changed', { action: 'update', id: svc.id });
+
+  let state = pm.stateOf(svc.id);
+  let startError = null;
+  if (running) {
+    try {
+      state = await pm.start(svc.id);
+    } catch (err) {
+      startError = err.message;
+      logs.append(svc.id, `按新启动命令重启失败：${err.message}`, 'stderr');
+    }
+  }
+  res.json({
+    ok: true,
+    service: { ...serviceView(updated), state },
+    plan: newPlan,
+    previousPlan: oldPlan,
+    restarted: running && !startError,
+    startError,
+  });
+}));
+
+/**
+ * 预览启动计划：把表单里的草稿合并到服务配置上解析，
+ * 不落盘、不启动，用于「保存之前先看看到底会执行什么命令」。
+ */
+app.post('/api/services/:id/plan', wrap(async (req, res) => {
+  const svc = requireService(req);
+  const candidate = { ...svc, ...pickServicePatch(req.body || {}) };
+  const plan = validateLaunchConfig(candidate);
+  res.json({ ok: true, plan });
+}));
+
+/** 终止某个「额外外部实例」（探测器已记录在案的 PID） */
+app.post('/api/services/:id/kill-external', wrap(async (req, res) => {
+  const svc = requireService(req);
+  const pid = Number(req.body?.pid);
+  if (!Number.isInteger(pid) || pid <= 0) {
+    throw Object.assign(new Error('缺少有效的 pid'), { code: 'BAD_REQUEST' });
+  }
+  const result = await pm.killExtra(svc.id, pid);
+  res.json({ ok: true, ...result, state: pm.stateOf(svc.id) });
 }));
 
 app.delete('/api/services/:id', wrap(async (req, res) => {
@@ -769,7 +1033,7 @@ app.get('/api/services/:id/preflight', wrap(async (req, res) => {
   // 最后一项很关键：像 image-clip 这种端口写在代码里、配置为空的服务，
   // 第一次崩溃后我们就记住了它想用哪个端口，第二次点「启动」就能提前弹窗而不是再崩一次。
   const candidate = Number.isInteger(explicit) && explicit > 0 ? explicit
-    : (svc.port || detected[0]?.port || st.crashPort || null);
+    : (svc.port || detected[0]?.port || st.crashPort || (svc.lastPorts || [])[0] || null);
 
   if (!candidate) {
     res.json({
@@ -853,6 +1117,8 @@ app.post('/api/services/:id/stop', wrap(async (req, res) => {
   requireService(req);
   const force = req.body?.force === true;
   const result = await pm.stop(req.params.id, { force });
+  // 刚停掉的进程可能还留在进程枚举缓存里，立即失效，避免下一次外部探测"复活"它
+  sampler.invalidateNodeCaches();
   res.json({ ok: true, ...result, state: pm.stateOf(req.params.id) });
 }));
 

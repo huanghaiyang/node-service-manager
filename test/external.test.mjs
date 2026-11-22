@@ -5,7 +5,13 @@ import { load, ppidMap, cmdMap } from './helpers.mjs';
 const {
   normPath, depthOf, candidateRank, subtreeOf,
   corroboratesLaunch, isPmWrapper, topmostWrapper, cmdLabel,
+  referencesProject, containsRoot, isShellShimName, launchGroupRoot, collectKnownPorts,
 } = await load('external.js');
+
+/** 构建 pid → 进程名 映射 */
+function nameMap(pairs) {
+  return new Map(pairs);
+}
 
 const ROOT = 'D:\\sgames\\gaea-rea';
 const ROOT_FWD = 'd:/sgames/gaea-rea';
@@ -191,5 +197,129 @@ describe('cmdLabel', () => {
   test('空值返回空串', () => {
     assert.equal(cmdLabel(''), '');
     assert.equal(cmdLabel(null), '');
+  });
+});
+
+describe('referencesProject / containsRoot（同前缀的兄弟目录不能误判）', () => {
+  test('命中项目目录', () => {
+    assert.equal(referencesProject(`node ${ROOT}\\node_modules\\vite\\bin\\vite.js`, [ROOT]), true);
+  });
+  test('同前缀的兄弟目录不算命中（gaea-rea-tools）', () => {
+    assert.equal(referencesProject('node D:\\sgames\\gaea-rea-tools\\node_modules\\vite\\bin\\vite.js', [ROOT]), false);
+  });
+  test('路径边界：分隔符 / 结束 / 引号都算', () => {
+    assert.equal(containsRoot('d:/sgames/gaea-rea/node_modules/x', 'd:/sgames/gaea-rea'), true);
+    assert.equal(containsRoot('d:/sgames/gaea-rea', 'd:/sgames/gaea-rea'), true);
+    assert.equal(containsRoot('"d:/sgames/gaea-rea" arg', 'd:/sgames/gaea-rea'), true);
+    assert.equal(containsRoot('d:/sgames/gaea-reax', 'd:/sgames/gaea-rea'), false);
+  });
+  test('空值安全', () => {
+    assert.equal(referencesProject(null, [ROOT]), false);
+    assert.equal(referencesProject('node x', []), false);
+  });
+});
+
+describe('corroboratesLaunch 支持多端口（同一个服务监听多个端口）', () => {
+  test('已知端口集合里任意一个被监听即可佐证', () => {
+    const ppid = ppidMap([[400, 1]]);
+    const why = corroboratesLaunch({
+      pid: 400, ppidOf: ppid, cmdOf: cmdMap([[400, 'node server.js']]),
+      portsOfPid: () => [{ proto: 'tcp', port: 8080, address: '127.0.0.1' }],
+      roots: [ROOT], packageJsonPath: `${ROOT}\\package.json`,
+      declaredPorts: [3000, 8080, 5173],
+    });
+    assert.equal(why, 'port');
+  });
+  test('端口集合都不匹配时不算佐证', () => {
+    const ppid = ppidMap([[401, 1]]);
+    const why = corroboratesLaunch({
+      pid: 401, ppidOf: ppid, cmdOf: cmdMap([[401, 'node server.js']]),
+      portsOfPid: () => [{ proto: 'tcp', port: 9999, address: '127.0.0.1' }],
+      roots: [ROOT], packageJsonPath: `${ROOT}\\package.json`,
+      declaredPorts: [3000, 8080],
+    });
+    assert.equal(why, null);
+  });
+  test('仍兼容旧的 declaredPort 单端口入参', () => {
+    const ppid = ppidMap([[402, 1]]);
+    const why = corroboratesLaunch({
+      pid: 402, ppidOf: ppid, cmdOf: cmdMap([[402, 'node server.js']]),
+      portsOfPid: () => [{ proto: 'tcp', port: 8787, address: '127.0.0.1' }],
+      roots: [ROOT], packageJsonPath: `${ROOT}\\package.json`, declaredPort: 8787,
+    });
+    assert.equal(why, 'port');
+  });
+  test('兄弟进程（跨 cmd.exe 垫片）监听另一端口也算佐证', () => {
+    // 10(npm-cli) → 20(cmd.exe) → 30(vite) / 31(node api, 3000)
+    const ppid = ppidMap([[10, 5], [20, 10], [30, 20], [31, 20]]);
+    const cmds = cmdMap([
+      [10, 'node C:\\nodejs\\node_modules\\npm\\bin\\npm-cli.js run dev'],
+      [30, `node ${ROOT}\\tools\\dev-proxy.js`],
+      [31, 'node server/index.js'],
+    ]);
+    const why = corroboratesLaunch({
+      pid: 10, ppidOf: ppid, cmdOf: cmds,
+      portsOfPid: (pid) => (pid === 31 ? [{ proto: 'tcp', port: 3000, address: '127.0.0.1' }] : []),
+      roots: [ROOT], packageJsonPath: `${ROOT}\\package.json`, declaredPorts: [3000],
+    });
+    assert.equal(why, 'port');
+  });
+});
+
+describe('launchGroupRoot（多实例 / 多端口的核心）', () => {
+  test('识别 shell 垫片', () => {
+    assert.equal(isShellShimName('cmd.exe'), true);
+    assert.equal(isShellShimName('powershell.exe'), true);
+    assert.equal(isShellShimName('node.exe'), false);
+    assert.equal(isShellShimName(''), false);
+  });
+
+  test('穿过 cmd.exe 垫片找到 npm 包装层作为启动根', () => {
+    // 5(shell) → 10(node npm-cli) → 20(cmd.exe) → 30(vite) / 31(api)
+    const ppid = ppidMap([[10, 5], [20, 10], [30, 20], [31, 20]]);
+    const cmds = cmdMap([
+      [10, 'node C:/nodejs/node_modules/npm/bin/npm-cli.js run dev'],
+      [30, `node ${ROOT}\\node_modules\\vite\\bin\\vite.js`],
+      [31, `node ${ROOT}\\server\\index.js`],
+    ]);
+    const names = nameMap([[10, 'node'], [20, 'cmd'], [30, 'node'], [31, 'node']]);
+    const args = { ppidOf: ppid, nameOf: (pid) => names.get(pid), cmdOf: cmds, roots: [ROOT], packageJsonPath: `${ROOT}\\package.json` };
+    assert.equal(launchGroupRoot({ pid: 30, ...args }), 10);
+    assert.equal(launchGroupRoot({ pid: 31, ...args }), 10);
+  });
+
+  test('不穿过交互式终端（父进程不是 node、也不是启动垫片）', () => {
+    // 30(node api) ← 40(pwsh 交互式)
+    const ppid = ppidMap([[30, 40], [40, 1]]);
+    const cmds = cmdMap([[30, `node ${ROOT}\\server\\index.js`]]);
+    const names = nameMap([[30, 'node'], [40, 'pwsh']]);
+    assert.equal(launchGroupRoot({
+      pid: 30, ppidOf: ppid, nameOf: (pid) => names.get(pid), cmdOf: cmds, roots: [ROOT],
+    }), 30);
+  });
+
+  test('上溯穿过 concurrently，一路取到 npm 包装层', () => {
+    // 5(shell) → 10(npm) → 11(concurrently) → 20(cmd) → 30(vite) / 31(api)
+    const ppid = ppidMap([[10, 5], [11, 10], [20, 11], [30, 20], [31, 20]]);
+    const cmds = cmdMap([
+      [10, 'node C:/nodejs/node_modules/npm/bin/npm-cli.js run dev'],
+      [11, `node ${ROOT}\\node_modules\\concurrently\\dist\\bin\\concurrently.js -n a,b npm:a npm:b`],
+      [30, `node ${ROOT}\\node_modules\\vite\\bin\\vite.js`],
+    ]);
+    const names = nameMap([[10, 'node'], [11, 'node'], [20, 'cmd']]);
+    assert.equal(launchGroupRoot({
+      pid: 30, ppidOf: ppid, nameOf: (pid) => names.get(pid), cmdOf: cmds, roots: [ROOT],
+      packageJsonPath: `${ROOT}\\package.json`,
+    }), 10);
+  });
+});
+
+describe('collectKnownPorts', () => {
+  test('合并配置端口、上次监听端口、崩溃端口并去重排序', () => {
+    assert.deepEqual(collectKnownPorts(3000, [5173, 3000], 8787, null), [3000, 5173, 8787]);
+  });
+  test('过滤非法值', () => {
+    assert.deepEqual(collectKnownPorts(0, -1, 70000, '3000'), [3000]);
+    assert.deepEqual(collectKnownPorts(), []);
   });
 });

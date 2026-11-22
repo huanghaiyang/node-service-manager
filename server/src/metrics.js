@@ -206,7 +206,11 @@ export class ProcessSampler {
   }
 
   async detect(force = false) {
-    if (this.provider && !force) return this.provider;
+    // basic 是「WMI 那次探测失败」的降级结果，不一定永久成立：
+    // 采样与外部探测都会抢 PowerShell，WMI 偶尔超时；30s 后重试一次 WMI，
+    // 否则一次抖动会让整个会话都拿不到命令行，外部启动探测随之失效。
+    if (this.provider && this.provider !== 'basic' && !force) return this.provider;
+    if (this.provider === 'basic' && !force && Date.now() - (this._degradedAt || 0) < 30000) return this.provider;
     if (this._probing) return this._probing;
     this._probing = (async () => {
       if (process.platform === 'linux') {
@@ -223,6 +227,7 @@ export class ProcessSampler {
           if (basic.size) {
             this.provider = 'basic';
             this.treeSupported = false;
+            this._degradedAt = Date.now();
             this.warning = '当前环境无法读取 WMI（进程父子关系不可用），指标仅统计服务主进程；建议在服务配置里使用「直接 node 启动」以获得准确占用。';
           } else {
             this.provider = 'none';
@@ -243,6 +248,7 @@ export class ProcessSampler {
   _set(provider, snapshot) {
     this.provider = provider;
     this.treeSupported = provider !== 'basic';
+    this._degradedAt = 0;
     this.warning = '';
     if (snapshot) this._lastFull = snapshot;
   }
@@ -299,10 +305,24 @@ export class ProcessSampler {
 
   /** 汇总某个根进程的整棵进程树 */
   aggregate(snapshot, rootPid) {
+    return this.aggregateMany(snapshot, [rootPid]);
+  }
+
+  /**
+   * 汇总**多个根进程**的并集（同一个服务可能有多个启动根）。
+   *
+   * 外部启动的服务经常是「一个启动器 + 多个监听进程」：concurrently 同时跑前端与后端、
+   * 或者同一个项目被手动起了两个端口。只按单个 PID 采样时，兄弟进程既不在树里，
+   * 端口也不会被计入 —— 这就是「同一个服务多端口启动无法检测」的根因。
+   * 这里把多个根的子树合并成一个聚合结果，端口 / 进程数 / CPU / 内存都按并集算。
+   */
+  aggregateMany(snapshot, rootPids = []) {
     const { processes, cpuByPid, cores, treeSupported } = snapshot;
+    const roots = (rootPids || []).map(Number).filter((p) => Number.isInteger(p) && p > 0);
     const result = {
-      pid: rootPid,
-      alive: processes.has(rootPid),
+      pid: roots[0] || null,
+      roots,
+      alive: false,
       processCount: 0,
       memoryBytes: 0,
       cpuPercent: 0,
@@ -310,33 +330,29 @@ export class ProcessSampler {
       scope: treeSupported ? 'tree' : 'process',
       processes: [],
     };
-    if (!Number.isInteger(rootPid) || rootPid <= 0) return result;
+    if (!roots.length) return result;
 
-    let members = [];
+    const seen = new Set();
     if (treeSupported) {
-      // 从根出发做一次广度遍历，构建后代集合
       const childrenOf = new Map();
       for (const row of processes.values()) {
         if (!childrenOf.has(row.ppid)) childrenOf.set(row.ppid, []);
         childrenOf.get(row.ppid).push(row.pid);
       }
-      const seen = new Set([rootPid]);
-      const queue = [rootPid];
+      const queue = [...roots];
       while (queue.length) {
         const cur = queue.shift();
-        for (const child of childrenOf.get(cur) || []) {
-          if (seen.has(child)) continue;
-          seen.add(child);
-          queue.push(child);
-        }
+        if (seen.has(cur)) continue;
+        seen.add(cur);
+        for (const child of childrenOf.get(cur) || []) if (!seen.has(child)) queue.push(child);
       }
-      members = [...seen];
     } else {
-      members = processes.has(rootPid) ? [rootPid] : [];
+      for (const pid of roots) if (processes.has(pid)) seen.add(pid);
     }
+    result.alive = roots.some((pid) => processes.has(pid));
 
     let cpuSum = 0;
-    for (const pid of members) {
+    for (const pid of seen) {
       const row = processes.get(pid);
       if (!row) continue;
       const cpu = cpuByPid.get(pid) || 0;
@@ -349,7 +365,7 @@ export class ProcessSampler {
         name: row.name,
         rss: row.rss || 0,
         cpuPercent: cpu / cores * 100,
-        isRoot: pid === rootPid,
+        isRoot: roots.includes(pid),
       });
     }
     result.processes.sort((a, b) => b.rss - a.rss);
@@ -514,13 +530,22 @@ export class ProcessSampler {
    * @param {{ force?: boolean, ttlMs?: number, pids?: number[] }} [opts]
    * @returns {Promise<Map<number, {commandLine:string|null, startedAt:string|null, exePath:string|null}>>}
    */
+  /** 使进程枚举与命令行缓存失效（启停之后调用，避免刚变化的进程还留在缓存里） */
+  invalidateNodeCaches() {
+    this._nodeList = null;
+    this._nodeBasicPrev = null;
+    this._nodeDetail = null;
+  }
+
   async queryNodeProcessDetails({ force = false, ttlMs = 15000, pids = null } = {}) {
-    if (!force && this._nodeDetail && Date.now() - this._nodeDetail.ts < ttlMs) {
+    if (!force && this._nodeDetail && Date.now() - this._nodeDetail.ts < (this._nodeDetail.map?.size ? ttlMs : 10000)) {
       return this._nodeDetail.map;
     }
     let map = new Map();
     try {
-      if (process.platform === 'win32' && this.provider === 'wmi') {
+      if (process.platform === 'win32') {
+        // 不要按采样 provider 判定：basic 降级只是采样那一次 WMI 失败，
+        // 命令行（外部启动探测的关键信号）往往还能正常读到
         map = await nodeDetailViaWmi();
       } else if (process.platform === 'linux') {
         map = await nodeDetailViaProc(pids || [...(this.lastSnapshot?.processes.keys() ?? [])]);

@@ -348,9 +348,13 @@ export class ProcessManager extends EventEmitter {
     const s = this.runtime.get(id) || {};
     const child = this.children.get(id);
     const alive = child ? child.exitCode === null && !child.killed : isAlive(s.pid);
+    const pids = this._pidsOfState(s);
     return {
       status: s.status || STATUS.STOPPED,
       pid: s.pid || null,
+      // 同一个服务的全部实例根 PID：外部启动的服务可能有多个启动根（多端口/多实例）
+      pids,
+      externalPids: s.externalPids?.length ? [...s.externalPids] : null,
       startedAt: s.startedAt || null,
       stoppedAt: s.stoppedAt || null,
       exitCode: s.exitCode ?? null,
@@ -365,6 +369,8 @@ export class ProcessManager extends EventEmitter {
       // 是否由外部启动（含"外部启动后被接管"两种情况）
       adopted: s.adopted === true,
       external: s.external || null,
+      // 服务已由本端托管时，仍检测到的「同一服务的额外外部实例」（多端口启动的典型形态）
+      extraInstances: s.extraInstances || null,
       // 弱信号：端口上有非托管进程，但不足以断定「就是它在跑」——只作提示
       externalHint: s.externalHint || null,
       alive,
@@ -374,6 +380,25 @@ export class ProcessManager extends EventEmitter {
         ? Date.now() - new Date(s.startedAt).getTime()
         : 0,
     };
+  }
+
+  /**
+   * 当前实例组的全部根 PID（本端 spawn 的根进程，或外部启动识别出的多个启动根）。
+   * @param {object} s 运行时状态
+   * @returns {number[]}
+   */
+  _pidsOfState(s) {
+    const pids = [];
+    if (Number.isInteger(s?.pid) && s.pid > 0) pids.push(s.pid);
+    for (const pid of s?.externalPids || []) {
+      if (Number.isInteger(pid) && pid > 0 && !pids.includes(pid)) pids.push(pid);
+    }
+    return pids;
+  }
+
+  /** 供采样 / 停止使用的实例组 PID 列表 */
+  instancePids(id) {
+    return this._pidsOfState(this.runtime.get(id) || {});
   }
 
   _set(id, patch) {
@@ -454,25 +479,51 @@ export class ProcessManager extends EventEmitter {
       for (const [id, s] of this.runtime) {
         if (!s.pid) continue;
         if (s.status === STATUS.RUNNING || s.status === STATUS.STARTING || s.status === STATUS.ORPHANED) {
-          if (!isAlive(s.pid)) {
-            this.children.delete(id);
-            // 外部启动的进程没有 child 句柄，不会有 exit 事件，只能靠这次巡检发现它「自行停止」
-            const external = s.adopted === true || Boolean(s.external);
-            const lastError = external
-              ? '外部进程已退出（非本端启动，未收到退出事件）'
-              : (s.lastError || '进程已不存在（外部终止或异常退出）');
-            this.store.update(id, { lastPid: null });
-            this._set(id, {
-              status: STATUS.EXITED,
-              pid: null,
-              stoppedAt: new Date().toISOString(),
-              lastError,
-              adopted: false,
-              external: null,
-              externalHint: null,
-            });
-            this.logs.append(id, `${external ? '外部' : ''}进程 PID=${s.pid} 已退出，状态回落为「已退出」`, 'system');
+          const pids = this._pidsOfState(s);
+          const alivePids = pids.filter((pid) => isAlive(pid));
+          if (alivePids.length) {
+            // 多实例服务：主 PID 退出但同组的另一个实例仍活着 —— 只换主 PID，不能当成整体退出。
+            // 这正是「同一个服务用多个端口启动」时最容易误判的地方。
+            if (!alivePids.includes(s.pid)) {
+              const nextPrimary = alivePids[0];
+              this.store.update(id, { lastPid: nextPrimary });
+              this._set(id, {
+                pid: nextPrimary,
+                externalPids: alivePids,
+                adopted: false,
+                ...(s.external ? { external: { ...s.external, pid: nextPrimary } } : {}),
+              });
+              this.logs.append(
+                id,
+                `实例组的主进程 PID=${s.pid} 已退出，改由仍存活的外部实例 PID=${nextPrimary} 代表该服务（共 ${alivePids.length} 个）`,
+                'system',
+              );
+            } else if (alivePids.length !== pids.length) {
+              const dropped = pids.filter((pid) => !alivePids.includes(pid));
+              this._set(id, { externalPids: alivePids });
+              this.logs.append(id, `外部实例组中有进程退出（PID=${dropped.join(', ')}），其余 ${alivePids.length} 个仍在运行`, 'system');
+            }
+            continue;
           }
+          this.children.delete(id);
+          // 外部启动的进程没有 child 句柄，不会有 exit 事件，只能靠这次巡检发现它「自行停止」
+          const external = s.adopted === true || Boolean(s.external);
+          const lastError = external
+            ? '外部进程已退出（非本端启动，未收到退出事件）'
+            : (s.lastError || '进程已不存在（外部终止或异常退出）');
+          this.store.update(id, { lastPid: null });
+          this._set(id, {
+            status: STATUS.EXITED,
+            pid: null,
+            externalPids: null,
+            stoppedAt: new Date().toISOString(),
+            lastError,
+            adopted: false,
+            external: null,
+            externalHint: null,
+            extraInstances: null,
+          });
+          this.logs.append(id, `${external ? '外部' : ''}进程 PID=${s.pid} 已退出，状态回落为「已退出」`, 'system');
         }
       }
     }, 3000);
@@ -486,38 +537,68 @@ export class ProcessManager extends EventEmitter {
    * 探测器认出它之后先标记为 ORPHANED（UI 显示「外部运行中」），
    * 用户可以「接管」把它纳入托管，或者「终止」它。
    *
+   * 一个服务外部启动时往往不止一个根进程：`npm run dev` 可能同时拉起前端与后端
+   * （多个端口），也可能被手动起了多个实例。因此这里接收 **pids 数组**：
+   * 采样、端口归属、停止都按这个实例组整体处理，而不是只盯着单个 PID。
+   *
    * @param {string} id
-   * @param {{pid:number, matchedBy:string, detail:string, confidence?:string, startedAt?:string|null}} info
+   * @param {{pid:number, pids?:number[], matchedBy:string, detail:string, confidence?:string, startedAt?:string|null}} info
    * @returns {boolean} 状态是否真的发生了变化
    */
-  markExternal(id, { pid, matchedBy, detail, confidence = 'high', startedAt = null }) {
+  markExternal(id, { pid, pids = null, matchedBy, detail, confidence = 'high', startedAt = null }) {
     if (!Number.isInteger(pid) || pid <= 0) return false;
     const cur = this.runtime.get(id) || {};
-    // 已经在跟踪这个 pid（外部运行中或已接管）就不要再刷一次，避免 SSE 与日志抖动
-    if (cur.pid === pid) return false;
     // 正在启停中不要插队
     if ([STATUS.STARTING, STATUS.STOPPING].includes(cur.status)) return false;
+
+    const group = this._normalizePids(pids, pid);
+    // 已经在跟踪同一组实例（外部运行中或已接管）就不要再刷一次，避免 SSE 与日志抖动
+    const currentGroup = cur.externalPids?.length ? cur.externalPids : (cur.pid ? [cur.pid] : []);
+    if (cur.pid === pid && this._samePids(currentGroup, group) && cur.status === STATUS.ORPHANED) return false;
 
     this.store.update(id, { lastPid: pid });
     this._set(id, {
       status: STATUS.ORPHANED,
       pid,
+      externalPids: group.length > 1 ? group : null,
       adopted: false,
       externalHint: null,
       external: {
         pid,
+        pids: group,
         matchedBy,
         detail,
         confidence,
         detectedAt: new Date().toISOString(),
       },
-      startedAt: startedAt || null,
+      startedAt: startedAt || cur.startedAt || null,
       stoppedAt: null,
       lastError: null,
       pendingStop: false,
     });
-    this.logs.append(id, `检测到该服务正被外部运行：PID=${pid}（依据：${detail}）`, 'system');
+    this.logs.append(
+      id,
+      `检测到该服务正被外部运行：PID=${pid}${group.length > 1 ? `（实例组共 ${group.length} 个启动根：${group.join(', ')}）` : ''}（依据：${detail}）`,
+      'system',
+    );
     return true;
+  }
+
+  _normalizePids(pids, primary) {
+    const out = [];
+    const push = (value) => {
+      const pid = Number(value);
+      if (Number.isInteger(pid) && pid > 0 && !out.includes(pid)) out.push(pid);
+    };
+    push(primary);
+    for (const pid of pids || []) push(pid);
+    return out;
+  }
+
+  _samePids(a, b) {
+    const left = (a || []).map(Number).sort((x, y) => x - y);
+    const right = (b || []).map(Number).sort((x, y) => x - y);
+    return left.length === right.length && left.every((v, i) => v === right[i]);
   }
 
   /**
@@ -534,9 +615,11 @@ export class ProcessManager extends EventEmitter {
     this._set(id, {
       status: STATUS.STOPPED,
       pid: null,
+      externalPids: null,
       adopted: false,
       external: null,
       externalHint: null,
+      extraInstances: null,
       lastError: null,
     });
     this.logs.append(
@@ -574,6 +657,53 @@ export class ProcessManager extends EventEmitter {
   }
 
   /**
+   * 记录「同一服务的额外外部实例」。
+   *
+   * 场景：服务已经由本端托管运行，用户又在终端里起了一份（常见于想换个端口调试），
+   * 此时服务状态仍是「运行中」，旧探测器只扫描「没在跑的服务」，第二个实例完全不可见。
+   * 这里把每组外部实例的启动根 PID 与端口挂到状态上，只作提示、不改状态，
+   * 用户可以按需终止，避免出现「端口莫名其妙被占」却查不到来源的情况。
+   *
+   * @param {string} id
+   * @param {Array<{pid:number, ports:number[], detail:string}>|null} instances
+   * @returns {boolean} 是否发生变化
+   */
+  setExtraInstances(id, instances = null) {
+    const cur = this.runtime.get(id) || {};
+    const next = Array.isArray(instances) && instances.length ? instances : null;
+    const key = (list) => JSON.stringify((list || []).map((i) => [i.pid, [...(i.ports || [])].sort((a, b) => a - b)]).sort((a, b) => a[0] - b[0]));
+    if (key(cur.extraInstances) === key(next)) return false;
+    if (!next) {
+      if (!cur.extraInstances) return false;
+      this._set(id, { extraInstances: null });
+      return true;
+    }
+    this._set(id, { extraInstances: next });
+    this.logs.append(
+      id,
+      `检测到同一服务的额外外部实例：${next.map((i) => `PID=${i.pid}${i.ports?.length ? `（端口 ${i.ports.join(', ')}）` : ''}`).join('、')}`,
+      'system',
+    );
+    return true;
+  }
+
+  /**
+   * 终止某个「额外外部实例」。只允许终止探测器已记录在案的 PID，
+   * 避免前端传任意 PID 造成误杀。
+   */
+  async killExtra(id, pid) {
+    const cur = this.runtime.get(id) || {};
+    const target = Number(pid);
+    const known = (cur.extraInstances || []).find((i) => i.pid === target);
+    if (!known) throw Object.assign(new Error('该 PID 不是已记录的额外外部实例'), { code: 'NOT_FOUND' });
+    const ok = await this.killTree(target, { force: true, timeoutMs: 4000 });
+    const rest = (cur.extraInstances || []).filter((i) => i.pid !== target);
+    this._set(id, { extraInstances: rest.length ? rest : null });
+    this.logs.append(id, `额外外部实例 PID=${target} 已${ok ? '终止' : '尝试终止（结果未知）'}`, 'system');
+    return { killed: ok, pid: target };
+  }
+
+  /**
    * 接管外部启动的进程：把它的 PID 纳入托管。
    *
    * 接管后指标、监听端口、停止/强制停止都可以正常工作；
@@ -581,33 +711,45 @@ export class ProcessManager extends EventEmitter {
    *
    * @param {string} id
    * @param {number|null} explicitPid 弱信号（端口提示）下由调用方显式给出目标 PID
+   * @param {number[]|null} explicitPids 外部实例组里的其它启动根（多端口服务的兄弟实例）
    */
-  adopt(id, explicitPid = null) {
+  adopt(id, explicitPid = null, explicitPids = null) {
     const st = this.stateOf(id);
     const target = explicitPid || st.pid || st.externalHint?.pid || null;
     if (!target) throw Object.assign(new Error('没有可接管的外部进程'), { code: 'NOT_FOUND' });
-    if (!isAlive(target)) {
+    const candidates = this._normalizePids(
+      [...(explicitPids || []), ...(st.externalPids || [])],
+      target,
+    );
+    const alive = candidates.filter((pid) => isAlive(pid));
+    if (!alive.length) {
       this.store.update(id, { lastPid: null });
-      this._set(id, { status: STATUS.STOPPED, pid: null, adopted: false, external: null, externalHint: null });
+      this._set(id, {
+        status: STATUS.STOPPED, pid: null, externalPids: null, adopted: false, external: null, externalHint: null,
+      });
       throw Object.assign(new Error('外部进程已经退出，无法接管'), { code: 'NOT_FOUND' });
     }
+    const primary = alive.includes(target) ? target : alive[0];
     this._set(id, {
       status: STATUS.RUNNING,
-      pid: target,
+      pid: primary,
+      externalPids: alive.length > 1 ? alive : null,
       adopted: true,
       startedAt: st.startedAt || new Date().toISOString(),
       lastError: null,
       externalHint: null,
+      extraInstances: null,
       external: {
         ...(st.external || st.externalHint || {}),
-        pid: target,
+        pid: primary,
+        pids: alive,
         adoptedAt: new Date().toISOString(),
       },
     });
-    this.store.update(id, { lastPid: target });
+    this.store.update(id, { lastPid: primary });
     this.logs.append(
       id,
-      `已接管外部进程 PID=${target}：指标 / 监听端口 / 停止均可正常使用（未收到退出事件，退出靠巡检发现）`,
+      `已接管外部进程 PID=${primary}${alive.length > 1 ? `（实例组共 ${alive.length} 个启动根：${alive.join(', ')}）` : ''}：指标 / 监听端口 / 停止均可正常使用（未收到退出事件，退出靠巡检发现）`,
       'system',
     );
     return this.stateOf(id);
@@ -663,6 +805,9 @@ export class ProcessManager extends EventEmitter {
       status: STATUS.STARTING,
       gen,
       pid: child.pid,
+      // 新一轮生命周期：清掉上一轮残留的实例组 / 额外实例记录
+      externalPids: null,
+      extraInstances: null,
       effectivePort,
       startedAt: new Date().toISOString(),
       stoppedAt: null,
@@ -784,12 +929,19 @@ export class ProcessManager extends EventEmitter {
       this._set(id, { status: STATUS.STOPPED, pid: null });
       return { stopped: true, alreadyStopped: true };
     }
+    const pids = st.pids?.length ? st.pids : [pid];
     this._set(id, { status: STATUS.STOPPING, lastError: null, pendingStop: true });
-    this.logs.append(id, `正在停止 PID=${pid}${force ? '（强制）' : ''}…`, 'system');
-    const ok = await this.killTree(pid, { force, timeoutMs });
+    this.logs.append(
+      id,
+      `正在停止 PID=${pid}${pids.length > 1 ? `（实例组共 ${pids.length} 个：${pids.join(', ')}）` : ''}${force ? '（强制）' : ''}…`,
+      'system',
+    );
+    // 多实例服务必须整组终止，否则「停止」只杀掉一个实例，另一个仍在占端口
+    const results = await Promise.all(pids.map((p) => this.killTree(p, { force, timeoutMs })));
+    const ok = results.every(Boolean);
     if (!ok) {
-      this.logs.append(id, `停止失败：进程树可能未被完全终止（PID=${pid}）`, 'stderr');
-      this._set(id, { status: STATUS.CRASHED, pid, lastError: '停止超时，进程可能仍在运行' });
+      this.logs.append(id, `停止失败：实例组中仍有进程未终止（${pids.join(', ')}）`, 'stderr');
+      this._set(id, { status: STATUS.CRASHED, pid, lastError: '停止超时，进程可能仍在运行', extraInstances: null });
       throw Object.assign(new Error('停止超时，进程可能仍在运行'), { code: 'STOP_TIMEOUT' });
     }
     this.children.delete(id);
@@ -799,6 +951,8 @@ export class ProcessManager extends EventEmitter {
     this._set(id, {
       status: STATUS.STOPPED,
       pid: null,
+      externalPids: null,
+      extraInstances: null,
       stoppedAt: new Date().toISOString(),
       adopted: false,
       external: null,
@@ -824,19 +978,27 @@ export class ProcessManager extends EventEmitter {
       this._set(id, { status: STATUS.STOPPED, pid: null });
       return { killed: false };
     }
-    const ok = await this.killTree(st.pid, { force: true, timeoutMs: 4000 });
+    const pids = st.pids?.length ? st.pids : [st.pid];
+    const results = await Promise.all(pids.map((p) => this.killTree(p, { force: true, timeoutMs: 4000 })));
+    const ok = results.every(Boolean);
     this.store.update(id, { lastPid: null, desiredRunning: false });
     // 残留进程不属于本轮托管（没有 child 句柄，不会有 exit 事件），因此不涉及 pendingStop
     this._set(id, {
       status: STATUS.STOPPED,
       pid: null,
+      externalPids: null,
+      extraInstances: null,
       stoppedAt: new Date().toISOString(),
       lastError: null,
       adopted: false,
       external: null,
       externalHint: null,
     });
-    this.logs.append(id, `残留进程 PID=${st.pid} 已${ok ? '终止' : '尝试终止（结果未知）'}`, 'system');
+    this.logs.append(
+      id,
+      `残留进程${pids.length > 1 ? `组（PID=${pids.join(', ')}）` : ` PID=${st.pid}`} 已${ok ? '终止' : '尝试终止（结果未知）'}`,
+      'system',
+    );
     return { killed: ok };
   }
 
@@ -917,8 +1079,8 @@ export class ProcessManager extends EventEmitter {
   stopAll() {
     const ids = [...this.runtime.keys()];
     return Promise.allSettled(ids.map(async (id) => {
-      const st = this.stateOf(id);
-      if (st.pid) await this.killTree(st.pid, { force: true, timeoutMs: 3000 });
+      const pids = this.instancePids(id);
+      await Promise.all(pids.map((pid) => this.killTree(pid, { force: true, timeoutMs: 3000 })));
     }));
   }
 

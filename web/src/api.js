@@ -38,6 +38,12 @@ export const api = {
   get: (id) => request(`/api/services/${id}`),
   create: (payload) => request('/api/services', { method: 'POST', body: payload }),
   update: (id, patch) => request(`/api/services/${id}`, { method: 'PATCH', body: patch }),
+  /** 更换启动命令；服务运行中时带 restart: true 会「停 → 存 → 启」 */
+  changeLaunch: (id, payload) => request(`/api/services/${id}/launch-config`, { method: 'POST', body: payload }),
+  /** 预览草稿的启动计划（不落盘、不启动） */
+  planPreview: (id, draft) => request(`/api/services/${id}/plan`, { method: 'POST', body: draft }),
+  /** 终止同一服务的额外外部实例 */
+  killExternal: (id, pid) => request(`/api/services/${id}/kill-external`, { method: 'POST', body: { pid } }),
   remove: (id, force = true) => request(`/api/services/${id}`, { method: 'DELETE', query: { force } }),
 
   start: (id, opts = {}) => request(`/api/services/${id}/start`, { method: 'POST', body: opts }),

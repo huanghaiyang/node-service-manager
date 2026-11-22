@@ -396,6 +396,10 @@ export const actions = {
   forceStop: (svc) => run(() => api.stop(svc.id, true), { okMessage: `已强制停止 ${svc.name}` }),
   restart: (svc) => run(() => api.restart(svc.id), { okMessage: `已重启 ${svc.name}`, id: svc.id }),
   killOrphan: (svc) => run(() => api.killOrphan(svc.id), { okMessage: `已终止 ${svc.name} 的残留进程` }),
+  killExtra: (svc, pid) => run(
+    () => api.killExternal(svc.id, pid),
+    { okMessage: `已终止 ${svc.name} 的额外实例（PID ${pid}）`, id: svc.id },
+  ),
   adopt: (svc) => run(
     () => api.adopt(svc.id, svc.state?.pid || svc.state?.externalHint?.pid || null),
     { okMessage: `已接管 ${svc.name} 的外部进程`, id: svc.id },

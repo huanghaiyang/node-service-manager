@@ -19,6 +19,9 @@ const PERSIST_FIELDS = [
   'args', 'env', 'cwd', 'port', 'autoRestart', 'description', 'nodeVersion',
   // 浏览器入口：留空则按探测到的监听端口自动推导
   'entryUrl',
+  // 上次实际探测到的 TCP 监听端口（可能有多个）：服务常常不配置 port，
+  // 端口写在代码/.env 里，没有这份记录外部启动时就只剩「命令行」一个信号
+  'lastPorts',
   'createdAt', 'updatedAt',
   // 运行期痕迹：管理端重启后据此识别残留进程
   'lastPid', 'lastStartedAt',
@@ -48,6 +51,9 @@ function sanitize(raw, { isNew }) {
     description: raw.description ? String(raw.description).slice(0, 500) : '',
     nodeVersion: raw.nodeVersion ? String(raw.nodeVersion) : '',
     entryUrl: normalizeEntryUrl(raw.entryUrl),
+    lastPorts: Array.isArray(raw.lastPorts)
+      ? [...new Set(raw.lastPorts.map(Number).filter((p) => Number.isInteger(p) && p > 0 && p <= 65535))].slice(0, 12)
+      : [],
     createdAt: raw.createdAt || nowIso(),
     updatedAt: nowIso(),
     lastPid: Number.isInteger(Number(raw.lastPid)) && Number(raw.lastPid) > 0 ? Number(raw.lastPid) : null,

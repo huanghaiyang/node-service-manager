@@ -31,8 +31,12 @@ const cpuMax = computed(() => Math.min(100, Math.max(4, Math.ceil(Math.max(0, ..
 const memMax = computed(() => Math.max(1, ...history.value.memory) * 1.15);
 
 const form = reactive({
-  name: '', port: '', args: '', env: '', autoRestart: false, script: '', runtime: 'npm', command: '', entryUrl: '',
+  name: '', port: '', args: '', env: '', autoRestart: false, script: '', runtime: 'npm', command: '', entryUrl: '', cwd: '',
 });
+/** 启动计划预览（保存前先看清到底会执行什么命令） */
+const planPreview = ref(null);
+const previewError = ref('');
+const previewing = ref(false);
 
 const ports = computed(() => props.service.ports || []);
 const entry = computed(() => props.service.entry || { url: '', source: 'none', live: false });
@@ -49,6 +53,25 @@ function syncForm() {
   form.runtime = props.service.runtime || 'npm';
   form.command = props.service.command || '';
   form.entryUrl = props.service.entryUrl || '';
+  form.cwd = props.service.cwd || '';
+  planPreview.value = null;
+  previewError.value = '';
+}
+
+/** 表单 → 接口载荷（保存与预览共用，避免两处漂移） */
+function draftPayload() {
+  return {
+    name: form.name,
+    port: form.port === '' ? null : Number(form.port),
+    args: parseArgs(form.args),
+    env: parseEnv(form.env),
+    autoRestart: form.autoRestart,
+    script: form.script,
+    runtime: form.runtime,
+    command: form.command,
+    entryUrl: form.entryUrl,
+    cwd: form.cwd.trim() || props.service.root,
+  };
 }
 
 onMounted(async () => {
@@ -63,7 +86,8 @@ onMounted(async () => {
   }
 });
 
-watch(() => props.service, syncForm);
+// 快照每 3s 会换成新对象；只在切换服务时回填，避免把用户正在编辑的表单冲掉
+watch(() => props.service?.id, (id) => { if (id) syncForm(); });
 
 watch(tab, (next) => {
   if (next === 'logs') void loadLogs(props.service.id, 800);
@@ -72,25 +96,61 @@ watch(tab, (next) => {
 async function save() {
   saving.value = true;
   try {
-    await api.update(props.service.id, {
-      name: form.name,
-      port: form.port === '' ? null : Number(form.port),
-      args: parseArgs(form.args),
-      env: parseEnv(form.env),
-      autoRestart: form.autoRestart,
-      script: form.script,
-      runtime: form.runtime,
-      command: form.command,
-      entryUrl: form.entryUrl,
-    });
+    await api.update(props.service.id, draftPayload());
     toast('配置已保存', 'ok');
     await refresh();
+    syncForm();
   } catch (err) {
     toast(err.message, 'err', 6000);
   } finally {
     saving.value = false;
   }
 }
+
+/** 运行中更换启动命令：后端按「停 → 存 → 启」执行，避免改完还要手动重启 */
+async function saveAndRestart() {
+  saving.value = true;
+  try {
+    const res = await api.changeLaunch(props.service.id, { ...draftPayload(), restart: true });
+    if (res.startError) {
+      toast(`启动命令已保存，但按新命令启动失败：${res.startError}`, 'err', 9000);
+    } else {
+      toast('启动命令已更换，服务已按新命令重启', 'ok');
+    }
+    planPreview.value = res.plan || null;
+    await loadLogs(props.service.id);
+    await refresh();
+    const keepPlan = planPreview.value;
+    syncForm();
+    planPreview.value = keepPlan;
+  } catch (err) {
+    toast(err.message, 'err', 7000);
+  } finally {
+    saving.value = false;
+  }
+}
+
+/** 预览启动计划：不落盘、不启动，只解析出实际会执行的命令 */
+async function preview() {
+  previewing.value = true;
+  previewError.value = '';
+  try {
+    const res = await api.planPreview(props.service.id, draftPayload());
+    planPreview.value = res.plan;
+  } catch (err) {
+    planPreview.value = null;
+    previewError.value = err.message;
+  } finally {
+    previewing.value = false;
+  }
+}
+
+/** 表单里填的 script 是否已存在于 package.json（允许自由输入，但先提示一下） */
+const scriptKnown = computed(() => {
+  const name = form.script.trim();
+  if (!name) return false;
+  return (pkgInfo.value?.scripts || []).some((s) => s.name === name);
+});
 
 async function guard(fn) {
   busy.value = true;
@@ -129,10 +189,26 @@ const version = computed(() => pkgInfo.value?.version || '');
           <div v-if="st.lastError" class="banner warn" style="margin-bottom: 12px">
             <span>⚠</span><span class="grow">{{ st.lastError }}</span>
           </div>
+          <div v-if="st.extraInstances?.length" class="banner warn" style="margin-bottom: 12px">
+            <span>⚠</span>
+            <span class="grow">
+              该服务已托管运行，另有 {{ st.extraInstances.length }} 个外部实例：
+              <template v-for="(inst, i) in st.extraInstances" :key="inst.pid">
+                <span class="mono">PID {{ inst.pid }}</span><template v-if="inst.ports?.length">（端口 {{ inst.ports.join(', ') }}）</template><template v-if="i < st.extraInstances.length - 1">、</template>
+              </template>
+              。同一服务多端口启动时，指标与端口按实例组汇总。
+            </span>
+          </div>
 
           <div class="kv" style="grid-template-columns: repeat(auto-fit, minmax(120px, 1fr))">
             <div class="item"><span class="k">状态</span><span class="v">{{ statusLabel(st.status) }}</span></div>
-            <div class="item"><span class="k">PID</span><span class="v mono">{{ st.pid || '—' }}</span></div>
+            <div class="item">
+              <span class="k">PID</span>
+              <span class="v mono">
+                {{ st.pid || '—' }}
+                <span v-if="(st.pids?.length || 0) > 1" class="tag amber" style="margin-left: 4px">+{{ st.pids.length - 1 }} 实例</span>
+              </span>
+            </div>
             <div class="item"><span class="k">运行时长</span><span class="v">{{ ['running','starting'].includes(st.status) ? formatUptime(st.uptimeMs) : '—' }}</span></div>
             <div class="item"><span class="k">端口</span><span class="v mono">{{ service.port || '—' }}</span></div>
             <div class="item"><span class="k">重启次数</span><span class="v">{{ st.restarts || 0 }}</span></div>
@@ -302,17 +378,25 @@ const version = computed(() => pkgInfo.value?.version || '');
 
         <!-- 配置 -->
         <template v-else>
-          <div v-if="isRunning" class="banner warn" style="margin-bottom: 14px">
-            <span>⚠</span><span class="grow">服务运行中，配置为只读。请先停止服务再修改。</span>
+          <div v-if="isRunning" class="banner info" style="margin-bottom: 14px">
+            <span>ℹ</span>
+            <span class="grow">
+              服务运行中：可以直接修改启动命令，点「保存并重启」即按新命令重启；其余配置也会一并保存。
+            </span>
           </div>
+          <div v-else-if="st.status === 'orphaned'" class="banner warn" style="margin-bottom: 14px">
+            <span>⚠</span>
+            <span class="grow">该服务正在外部运行。更换启动命令前，请先「接管」或「终止」外部进程。</span>
+          </div>
+
           <div class="field" style="margin-bottom: 12px">
             <label>显示名称</label>
-            <input v-model="form.name" class="input" :disabled="isRunning" />
+            <input v-model="form.name" class="input" />
           </div>
           <div class="row" style="gap: 12px; margin-bottom: 12px; align-items: flex-start">
             <div class="field grow">
               <label>启动方式</label>
-              <select v-model="form.runtime" class="select" :disabled="isRunning">
+              <select v-model="form.runtime" class="select">
                 <option value="npm">npm script</option>
                 <option value="node">直接 node 启动入口文件</option>
                 <option value="custom">自定义命令</option>
@@ -320,21 +404,24 @@ const version = computed(() => pkgInfo.value?.version || '');
             </div>
             <div class="field grow">
               <label>监听端口（可选，会注入 PORT 环境变量）</label>
-              <input v-model="form.port" class="input" :disabled="isRunning" placeholder="例如 3000" />
+              <input v-model="form.port" class="input" placeholder="例如 3000" />
             </div>
           </div>
 
           <div v-if="form.runtime === 'npm'" class="field" style="margin-bottom: 12px">
-            <label>npm script</label>
-            <select v-model="form.script" class="select" :disabled="isRunning">
-              <option v-for="s in (pkgInfo?.scripts || [])" :key="s.name" :value="s.name">
-                {{ s.name }}{{ s.recommended ? '（推荐）' : '' }} — {{ s.command }}
-              </option>
-            </select>
+            <label>npm script（可直接输入脚本名）</label>
+            <input v-model="form.script" class="input mono" list="svc-script-options" placeholder="例如 dev" />
+            <datalist id="svc-script-options">
+              <option v-for="s in (pkgInfo?.scripts || [])" :key="s.name" :value="s.name">{{ s.command }}</option>
+            </datalist>
+            <span v-if="form.script && !scriptKnown" class="hint" style="color: #f0b35e">
+              package.json 里没有名为「{{ form.script }}」的 script，保存时会校验失败。
+            </span>
+            <span v-else class="hint">从 package.json 中选择，或直接输入脚本名（新加的 script 也能用）。</span>
           </div>
           <div v-else-if="form.runtime === 'custom'" class="field" style="margin-bottom: 12px">
             <label>自定义命令</label>
-            <input v-model="form.command" class="input mono" :disabled="isRunning" placeholder="例如 pnpm exec tsx src/server.ts" />
+            <input v-model="form.command" class="input mono" placeholder="例如 pnpm exec tsx src/server.ts" />
           </div>
           <div v-else class="card" style="padding: 10px 12px; margin-bottom: 12px">
             <div class="hint">入口文件</div>
@@ -343,7 +430,13 @@ const version = computed(() => pkgInfo.value?.version || '');
 
           <div class="field" style="margin-bottom: 12px">
             <label>附加参数（空格分隔，支持引号）</label>
-            <input v-model="form.args" class="input mono" :disabled="isRunning" placeholder="例如 --env production --port 3000" />
+            <input v-model="form.args" class="input mono" placeholder="例如 --env production --port 3000" />
+          </div>
+
+          <div class="field" style="margin-bottom: 12px">
+            <label>工作目录</label>
+            <input v-model="form.cwd" class="input mono" placeholder="默认与服务根目录一致" />
+            <span class="hint">命令会在这个目录下执行；留空则使用服务根目录。</span>
           </div>
 
           <div class="field" style="margin-bottom: 12px">
@@ -351,7 +444,6 @@ const version = computed(() => pkgInfo.value?.version || '');
             <input
               v-model="form.entryUrl"
               class="input mono"
-              :disabled="isRunning"
               placeholder="留空则按实时探测到的监听端口自动推导"
             />
             <span class="hint">
@@ -362,19 +454,51 @@ const version = computed(() => pkgInfo.value?.version || '');
 
           <div class="field" style="margin-bottom: 12px">
             <label>环境变量（每行 KEY=VALUE）</label>
-            <textarea v-model="form.env" class="textarea" :disabled="isRunning" rows="5" placeholder="NODE_ENV=production&#10;LOG_LEVEL=info" />
+            <textarea v-model="form.env" class="textarea" rows="5" placeholder="NODE_ENV=production&#10;LOG_LEVEL=info" />
           </div>
 
           <label class="row" style="gap: 8px; margin-bottom: 16px; cursor: pointer">
-            <input v-model="form.autoRestart" type="checkbox" :disabled="isRunning" />
+            <input v-model="form.autoRestart" type="checkbox" />
             <span>异常退出时自动重启（最多 5 次/分钟，指数退避）</span>
           </label>
 
+          <div class="section-title">启动计划预览</div>
+          <div class="card" style="padding: 12px 14px; margin-bottom: 14px">
+            <div class="row" style="gap: 8px; margin-bottom: 8px">
+              <span class="tag blue">{{ (planPreview || st.plan)?.mode || form.runtime }}</span>
+              <span class="hint">
+                {{ planPreview ? '按当前表单解析（尚未保存）' : (st.plan ? '当前生效的启动计划' : '尚未解析') }}
+              </span>
+            </div>
+            <div class="mono" style="font-size: 12.5px; word-break: break-all; line-height: 1.7">
+              {{ planPreview?.display || st.plan?.display || '—' }}
+            </div>
+            <div v-if="(planPreview || st.plan)?.note" class="hint" style="margin-top: 6px">
+              {{ (planPreview || st.plan).note }}
+            </div>
+            <div v-if="previewError" class="banner err" style="margin-top: 10px">
+              <span>✕</span><span class="grow">{{ previewError }}</span>
+            </div>
+            <div class="row" style="margin-top: 10px">
+              <button class="btn ghost sm" :disabled="previewing" @click="preview">
+                <span v-if="previewing" class="spin" /> 解析当前表单
+              </button>
+            </div>
+          </div>
+
           <div class="row">
-            <button class="btn primary" :disabled="isRunning || saving" @click="save">
+            <button
+              v-if="isRunning"
+              class="btn primary"
+              :disabled="saving || ['starting', 'stopping'].includes(st.status)"
+              @click="saveAndRestart"
+            >
+              <span v-if="saving" class="spin" /> 保存并重启
+            </button>
+            <button v-else class="btn primary" :disabled="saving" @click="save">
               <span v-if="saving" class="spin" /> 保存配置
             </button>
-            <button class="btn" :disabled="isRunning" @click="syncForm">重置</button>
+            <button class="btn" :disabled="saving" @click="syncForm">重置</button>
           </div>
         </template>
       </div>
